@@ -102,11 +102,11 @@ def layer_reconstruction(model: QuantModel, layer: QuantModule, cali_data: torch
         cur_out = cached_outs[idx].to(device)
         cur_grad = cached_grads[idx] if opt_mode != 'mse' else None
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         out_quant = layer(cur_inp)
 
         err = loss_func(out_quant, cur_out, cur_grad)
-        err.backward(retain_graph=True)
+        err.backward()
         #if torch.cuda.device_count() > 1:
         if multi_gpu:
             raise NotImplementedError
@@ -191,4 +191,3 @@ class LossFunction:
             logger.info('Total loss:\t{:.3f} (rec:{:.3f}, round:{:.3f})\tb={:.2f}\tcount={}'.format(
                   float(total_loss), float(rec_loss), float(round_loss), b, self.count))
         return total_loss
-

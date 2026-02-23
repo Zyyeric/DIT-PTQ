@@ -3,13 +3,6 @@ README.md
 setup.py
 ddim/__init__.py
 ddim/dpm_solver_pytorch.py
-ddim/datasets/__init__.py
-ddim/datasets/artcifar10.py
-ddim/datasets/celeba.py
-ddim/datasets/ffhq.py
-ddim/datasets/lsun.py
-ddim/datasets/utils.py
-ddim/datasets/vision.py
 ddim/functions/__init__.py
 ddim/functions/ckpt_util.py
 ddim/functions/denoising.py

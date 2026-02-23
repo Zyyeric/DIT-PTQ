@@ -32,7 +32,6 @@ from transformers import AutoFeatureExtractor
 
 logger = logging.getLogger(__name__)
 
-os.environ['CURL_CA_BUNDLE'] = '/etc/ssl/certs/ca-certificates.crt'
 # load safety model
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
@@ -408,9 +407,7 @@ def main():
 
     from diffusers import PixArtAlphaPipeline
     model = PixArtAlphaPipeline.from_pretrained("PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=torch.float16).to("cuda")
-    #model = PixArtAlphaPipeline.from_pretrained("PixArt-alpha/PixArt-XL-2-512x512", torch_dtype=torch.float16).to("cuda")
-    # NOTE to Ruichen. For debugging, you can do this to cheat and make sure the code functionally works. Since the transformer_blocks are sequential.
-    #model.transformer.transformer_blocks = model.transformer.transformer_blocks[:1]
+
     from qdiff.caption_util import get_captions
     if opt.prompt is None:
         pes, pams, npe, npam = get_captions("alpha", model, 
@@ -438,7 +435,6 @@ def main():
 
     assert(opt.cond)
     if opt.ptq:
-        # NOTE these do need to be MSE, but we can experiment
         wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse', 'fp': True, 
                     'mantissa_bits': opt.weight_mantissa_bits,
                     'attn_weight_mantissa': opt.attn_weight_mantissa,

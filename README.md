@@ -42,6 +42,29 @@ Expected files:
 - `train2017/`
 - `annotations/captions_train2017.json`
 
+Download commands (matches the hardcoded layout used by `scripts/pixart_alpha_calib.py`):
+```bash
+export COCO_ROOT=~/datasets/coco
+mkdir -p "$COCO_ROOT"
+cd "$COCO_ROOT"
+
+wget -c http://images.cocodataset.org/zips/train2017.zip
+wget -c http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+
+unzip -q train2017.zip
+unzip -q annotations_trainval2017.zip
+```
+
+If you run generation with `--coco_10k` or `--coco_9k`, this repo also expects:
+- `captions/captions_val2017.json`
+
+Create it from COCO annotations:
+```bash
+cd /path/to/DIT-PTQ
+mkdir -p captions
+cp "$COCO_ROOT/annotations/captions_val2017.json" captions/captions_val2017.json
+```
+
 ### 3) Generate Calibration Data
 ```bash
 python scripts/pixart_alpha_calib.py
@@ -57,3 +80,20 @@ python scripts/pixart_alpha_brecq.py --plms --cond --n_samples 1 --outdir <outpu
 ```bash
 python scripts/pixart_alpha_brecq.py --plms --cond --n_samples 1 --outdir <output_dir> --ptq --weight_bit 4 --quant_mode qdiff --cali_data_path pixart_calib_brecq.pt --cali_batch_size 16 --cali_iters 2500 --cali_iters_a 1 --quant_act --act_bit <6_or_8> --act_mantissa_bits <3_for_A6_or_4_for_A8> --cali_ckpt <ckpt> --resume_w --weight_group_size 128 --weight_mantissa_bits 1 --ff_weight_mantissa 0 --res 512 --coco_10k
 ```
+
+### 6) Evaluate (FID / sFID / CLIP-score)
+After generation, run:
+```bash
+python scripts/eval_metrics.py \
+  --gen_dir <output_dir>/<run_timestamp>/samples_10k \
+  --real_dir "$COCO_ROOT/val2017" \
+  --captions_json captions/captions_val2017.json \
+  --caption_mode coco_10k \
+  --save_json <output_dir>/<run_timestamp>/metrics.json
+```
+
+Notes:
+- `--caption_mode coco_10k` matches generation with `--coco_10k`.
+- For `--coco_9k`, use `--caption_mode coco_9k` and `samples_9k`.
+- CLIP-score prompt source can also be `--prompt_file` (one prompt/line) or `--prompt` (single prompt for all images).
+- `sFID` here is computed from Inception-v3 `Mixed_6e` spatial features (patch-level statistics), while `FID` uses global pooled Inception features.

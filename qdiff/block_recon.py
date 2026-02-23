@@ -161,7 +161,7 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
             cur_out = cached_outs[idx].to(device)
             cur_grad = cached_grads[idx].to(device) if opt_mode != 'mse' else None
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             if isinstance(cur_inp, tuple):
                 if len(cur_inp) == 8:
                     out_quant = block(*cur_inp)
@@ -171,7 +171,7 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
                 out_quant = block(cur_inp)
 
             err = loss_func(out_quant, cur_out, cur_grad)
-            err.backward(retain_graph=True)
+            err.backward()
             #if torch.cuda.device_count() > 1:
             if multi_gpu:
                 raise NotImplementedError
