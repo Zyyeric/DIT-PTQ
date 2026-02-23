@@ -1,0 +1,45 @@
+# UV/PIP equivalent of environment.yml for FP4DiT PixArt
+# Usage:
+#   uv venv -p 3.9
+#   source .venv/bin/activate
+#   uv pip install --upgrade pip
+#   uv pip install --extra-index-url https://download.pytorch.org/whl/cu117 -r requirements-uv.txt
+
+# PyTorch stack (CUDA 11.7)
+torch==1.13.1+cu117
+torchvision==0.14.1+cu117
+torchaudio==0.13.1
+
+# Base dependencies
+numpy<2
+setuptools<81
+diffusers==0.29.2
+pudb==2019.2
+invisible-watermark
+imageio==2.9.0
+imageio-ffmpeg==0.4.2
+test-tube>=0.7.5
+streamlit>=0.73.1
+torch-fidelity==0.3.0
+torchmetrics==0.6.0
+streamlit-drawable-canvas==0.8
+einops==0.3.0
+kornia==0.6.9
+lmdb==1.3.0
+natsort==8.3.1
+omegaconf==2.1.1
+opencv-python-headless==4.6.0.66
+pandas==1.4.2
+Pillow==9.0.1
+pytorch-lightning==1.4.2
+PyYAML==6.0
+six==1.16.0
+tqdm==4.64.0
+transformers==4.41.2
+sentencepiece
+accelerate
+
+# VCS/editable deps from original environment.yml
+git+https://github.com/openai/CLIP.git@main#egg=clip
+taming-transformers @ git+https://github.com/CompVis/taming-transformers.git@master
+-e .
