@@ -1,0 +1,2 @@
+checkpoints/*.pth filter=lfs diff=lfs merge=lfs -text
+checkpoints/ckpt_wq.pth.part-* filter=lfs diff=lfs merge=lfs -text
