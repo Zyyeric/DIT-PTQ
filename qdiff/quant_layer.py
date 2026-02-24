@@ -595,9 +595,13 @@ class QuantModule(nn.Module):
         else:
             weight = self.org_weight
             bias = self.org_bias
+        if input.device != weight.device:
+            input = input.to(weight.device)
         if weight.dtype != input.dtype:
             weight = weight.to(input.dtype)
-        if bias.dtype != input.dtype:
+        if bias is not None and bias.device != input.device:
+            bias = bias.to(input.device)
+        if bias is not None and bias.dtype != input.dtype:
             bias = bias.to(input.dtype)
         #print("Here we go again")
         #print(weight.dtype)
