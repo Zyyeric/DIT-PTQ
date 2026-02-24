@@ -19,10 +19,6 @@ env/
 datasets/
 data/
 captions/*.pt
-pixart_calib_brecq.pt
-*.ckpt
-*.pth
-*.safetensors
 
 # Runtime outputs/logs
 outputs/
