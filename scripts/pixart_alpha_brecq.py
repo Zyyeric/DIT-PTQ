@@ -93,6 +93,12 @@ def main():
     default=None,
     help="the prompt to render; if not provided, uses dataset captions"
     )
+    parser.add_argument(
+        "--max_prompts",
+        type=int,
+        default=None,
+        help="limit number of caption prompts used for generation when --prompt is not set",
+    )
 
     parser.add_argument(
         "--outdir",
@@ -416,6 +422,13 @@ def main():
                             coco2014=opt.coco2014,
                             hpsv2=opt.hpsv2,
                             pixart=opt.pixart)
+        if opt.max_prompts is not None:
+            if opt.max_prompts <= 0:
+                raise ValueError("--max_prompts must be a positive integer")
+            n_prompts = min(opt.max_prompts, pes.shape[0])
+            logger.info(f"Using {n_prompts} prompts out of {pes.shape[0]} available prompts")
+            pes = pes[:n_prompts]
+            pams = pams[:n_prompts]
         model.text_encoder = model.text_encoder.to("cpu")
 
     if opt.coco_9k:
