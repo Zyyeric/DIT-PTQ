@@ -13,6 +13,7 @@ import time
 from pytorch_lightning import seed_everything
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch import autocast
 from contextlib import nullcontext
 
@@ -82,6 +83,35 @@ def check_safety(x_image):
         if has_nsfw_concept[i]:
             x_checked_image[i] = load_replacement(x_checked_image[i])
     return x_checked_image, has_nsfw_concept
+
+
+def init_parallel(parallelism: str, backend: str):
+    mode = parallelism.lower()
+    if mode == "dp":
+        mode = "ddp"
+
+    if mode != "ddp":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return mode, False, 0, 0, 1, device
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("--parallelism ddp requires CUDA.")
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        raise RuntimeError("--parallelism ddp must be launched with torchrun (RANK/WORLD_SIZE env vars missing).")
+
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend, init_method="env://")
+    device = torch.device(f"cuda:{local_rank}")
+    return mode, True, rank, local_rank, world_size, device
+
+
+def finalize_parallel(use_ddp: bool):
+    if use_ddp and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def main():
@@ -391,31 +421,71 @@ def main():
     "--disable_group_quant", action="store_true",
     help="Disable group weight quantization"
     )
+    parser.add_argument(
+        "--parallelism",
+        type=str,
+        default="none",
+        choices=["none", "dp", "ddp"],
+        help="Calibration parallelism mode. 'dp' is treated as 'ddp'.",
+    )
+    parser.add_argument(
+        "--ddp_backend",
+        type=str,
+        default="nccl",
+        choices=["nccl", "gloo"],
+        help="Distributed backend when --parallelism=ddp.",
+    )
+    parser.add_argument(
+        "--parallel_generate",
+        action="store_true",
+        help="When using DDP and dataset prompts, shard prompt generation across ranks.",
+    )
     opt = parser.parse_args()
-    seed_everything(opt.seed)
+    parallel_mode, use_ddp, rank, local_rank, world_size, device = init_parallel(
+        opt.parallelism, opt.ddp_backend
+    )
+    is_main_process = rank == 0
+    do_parallel_generate = use_ddp and opt.parallel_generate and opt.prompt is None
+
+    seed_everything(opt.seed + rank)
 
     os.makedirs(opt.outdir, exist_ok=True)
-    outpath = os.path.join(opt.outdir, datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
-    os.makedirs(outpath)
+    run_tag = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S") if is_main_process else None
+    if use_ddp:
+        obj_list = [run_tag]
+        dist.broadcast_object_list(obj_list, src=0)
+        run_tag = obj_list[0]
+    outpath = os.path.join(opt.outdir, run_tag)
+    if is_main_process:
+        os.makedirs(outpath, exist_ok=True)
+    if use_ddp:
+        dist.barrier()
 
     log_path = os.path.join(outpath, "run.log")
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
         level=logging.INFO,
-        handlers=[
-            logging.FileHandler(log_path),
-            logging.StreamHandler()
-        ]
+        handlers=(
+            [logging.FileHandler(log_path), logging.StreamHandler()]
+            if is_main_process
+            else [logging.StreamHandler()]
+        )
     )
     logger = logging.getLogger(__name__)
+    logger.info(f"parallelism={parallel_mode}, world_size={world_size}, rank={rank}, local_rank={local_rank}")
+    if use_ddp and opt.parallel_generate and opt.prompt is not None and is_main_process:
+        logger.info("--parallel_generate is ignored when --prompt is provided (single prompt path).")
 
 
     from diffusers import PixArtAlphaPipeline
-    model = PixArtAlphaPipeline.from_pretrained("PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=torch.float16).to("cuda")
+    model = PixArtAlphaPipeline.from_pretrained(
+        "PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=torch.float16
+    ).to(device)
 
     from qdiff.caption_util import get_captions
-    if opt.prompt is None:
+    pes, pams, npe, npam = None, None, None, None
+    if opt.prompt is None and (is_main_process or do_parallel_generate):
         pes, pams, npe, npam = get_captions("alpha", model, 
                             coco_9k=opt.coco_9k,
                             coco_10k=opt.coco_10k,
@@ -444,8 +514,6 @@ def main():
     else:
         sp = "samples"
 
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
     assert(opt.cond)
     if opt.ptq:
         wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse', 'fp': True, 
@@ -473,7 +541,7 @@ def main():
             model=model.transformer, weight_quant_params=wq_params, act_quant_params=aq_params,
             act_quant_mode="qdiff", sm_abit=opt.sm_abit)
         #exit(0)
-        qnn.to("cuda")
+        qnn.to(device)
         qnn.eval()
 
         if opt.no_grad_ckpt:
@@ -517,13 +585,22 @@ def main():
             qnn.set_quant_state(weight_quant=True, act_quant=False)
 
             #print(qnn)
-            _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
+            cali_xs = cali_xs.to(device)
+            cali_ts = cali_ts.to(device)
+            cali_cs = cali_cs.to(device)
+            _ = qnn(
+                cali_xs[:2],
+                timestep=cali_ts[:2],
+                encoder_hidden_states=cali_cs[:2],
+                added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[:2]),
+            )
             logger.info("Initializing has done!")
 
             # TODO adjust some things here
             kwargs = dict(cali_data=cali_data, batch_size=opt.cali_batch_size, 
                     iters=opt.cali_iters, weight=0.01, asym=True, b_range=(20, 2),
-                    warmup=0.2, act_quant=False, opt_mode='mse', cond=opt.cond, sequential=opt.sequential_w, no_adaround=opt.no_adaround)
+                    warmup=0.2, act_quant=False, opt_mode='mse', cond=opt.cond, sequential=opt.sequential_w,
+                    no_adaround=opt.no_adaround, multi_gpu=use_ddp)
         
             def recon_model(model):
                 """
@@ -561,6 +638,8 @@ def main():
                 logger.info("Doing weight calibration")
                 recon_model(qnn)
                 qnn.set_quant_state(weight_quant=True, act_quant=False)
+                if use_ddp:
+                    dist.barrier()
                 # NOTE Checkpoint weight quantization calibation separately
                 logger.info("Saving calibrated quantized UNet model")
                 for m in qnn.model.modules():
@@ -573,7 +652,8 @@ def main():
                                 m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                             else:
                                 m.zero_point = nn.Parameter(m.zero_point)
-                torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt_wq.pth"))
+                if is_main_process:
+                    torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt_wq.pth"))
                 logger.info(model.transformer)
             if opt.quant_act and opt.disable_online_act_quant:
                 logger.info("UNet model")
@@ -583,23 +663,31 @@ def main():
                 qnn.set_quant_state(True, True)
                 with torch.no_grad():
                     inds = np.random.choice(cali_xs.shape[0], 16, replace=False)
-                    _ = qnn(cali_xs[inds].cuda(), timestep=cali_ts[inds].cuda(), encoder_hidden_states=cali_cs[inds].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[inds]))
+                    _ = qnn(
+                        cali_xs[inds],
+                        timestep=cali_ts[inds],
+                        encoder_hidden_states=cali_cs[inds],
+                        added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[inds]),
+                    )
                     if opt.running_stat:
                         logger.info('Running stat for activation quantization')
                         inds = np.arange(cali_xs.shape[0])
                         np.random.shuffle(inds)
                         qnn.set_running_stat(True, opt.rs_sm_only)
                         for i in trange(int(cali_xs.size(0) / 16)):
-                            _ = qnn(cali_xs[inds[i * 16:(i + 1) * 16]].cuda(), 
-                                timestep=cali_ts[inds[i * 16:(i + 1) * 16]].cuda(),
-                                encoder_hidden_states=cali_cs[inds[i * 16:(i + 1) * 16]].cuda(),
-                                added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[inds[i * 16:(i + 1) * 16]]))
+                            _ = qnn(
+                                cali_xs[inds[i * 16:(i + 1) * 16]],
+                                timestep=cali_ts[inds[i * 16:(i + 1) * 16]],
+                                encoder_hidden_states=cali_cs[inds[i * 16:(i + 1) * 16]],
+                                added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[inds[i * 16:(i + 1) * 16]]),
+                            )
                         qnn.set_running_stat(False, opt.rs_sm_only)
 
                 # TODO change these guys too.
                 kwargs = dict(
                     cali_data=cali_data, batch_size=opt.cali_batch_size, iters=opt.cali_iters_a, act_quant=True, 
-                    opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p, cond=opt.cond, sequential=opt.sequential_a)
+                    opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p, cond=opt.cond,
+                    sequential=opt.sequential_a, multi_gpu=use_ddp)
                 recon_model(qnn)
                 qnn.set_quant_state(weight_quant=True, act_quant=True)
             elif opt.quant_act:
@@ -627,57 +715,97 @@ def main():
                             m.zero_point = nn.Parameter(m.zero_point)
             #torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
 
-        qnn = qnn.to('cuda', dtype=torch.float16)
+        qnn = qnn.to(device=device, dtype=torch.float16)
         model.transformer = qnn
     
     #model.text_encoder = model.text_encoder.to("cuda")
 
-    sample_path = os.path.join(outpath, sp)
-    os.makedirs(sample_path, exist_ok=True)
-    base_count = len(os.listdir(sample_path))
-    grid_count = len(os.listdir(outpath)) - 1
+    if use_ddp:
+        dist.barrier()
 
-    # write config out
-    sampling_file = os.path.join(outpath, "sampling_config.yaml")
-    sampling_conf = vars(opt)
-    with open(sampling_file, 'a+') as f:
-        yaml.dump(sampling_conf, f, default_flow_style=False)
-    if opt.verbose:
-        logger.info("UNet model")
-        logger.info(model.model)
+    if do_parallel_generate:
+        sample_path = os.path.join(outpath, sp)
+        if is_main_process:
+            os.makedirs(sample_path, exist_ok=True)
+            sampling_file = os.path.join(outpath, "sampling_config.yaml")
+            sampling_conf = vars(opt)
+            with open(sampling_file, 'a+') as f:
+                yaml.dump(sampling_conf, f, default_flow_style=False)
+        dist.barrier()
 
-    #start_code = None
-    #if opt.fixed_code:
-    #    start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
-    batch_size = opt.n_samples
-    if opt.prompt is None:
-        for i in tqdm(range(0, pes.shape[0], batch_size), desc="data"):
-            torch.manual_seed(42) # Meaning of Life, the Universe and Everything
-            #prompts = data[i:i + batch_size]
-            #prompts = [p[0] for p in prompts]
-            #prompt_embeds = 
-            #image = model(prompt=prompts, height=opt.res, width=opt.res).images
-            prompt_embeds = pes[i:i + batch_size].to("cuda")
-            image = model(prompt=None, negative_prompt=None,
-                        prompt_embeds=prompt_embeds,
-                        prompt_attention_mask = pams[i:i + batch_size].to("cuda"),
-                        negative_prompt_embeds = npe.expand(prompt_embeds.shape[0], -1, -1),
-                        negative_prompt_attention_mask = npam.expand(prompt_embeds.shape[0], -1),
-                        height=opt.res, width=opt.res).images
+        batch_size = opt.n_samples
+        npe = npe.to(device)
+        npam = npam.to(device)
+        total = pes.shape[0]
+        local_indices = list(range(rank, total, world_size))
+        for start in tqdm(
+            range(0, len(local_indices), batch_size),
+            desc=f"rank{rank}-data",
+            disable=(rank != 0),
+        ):
+            torch.manual_seed(42)
+            batch_idx = local_indices[start:start + batch_size]
+            prompt_embeds = pes[batch_idx].to(device)
+            image = model(
+                prompt=None,
+                negative_prompt=None,
+                prompt_embeds=prompt_embeds,
+                prompt_attention_mask=pams[batch_idx].to(device),
+                negative_prompt_embeds=npe.expand(prompt_embeds.shape[0], -1, -1),
+                negative_prompt_attention_mask=npam.expand(prompt_embeds.shape[0], -1),
+                height=opt.res,
+                width=opt.res,
+            ).images
 
             for j, img in enumerate(image):
-                img.save(os.path.join(sample_path, f"{i+j}.png"))
-    else:
-        torch.manual_seed(42) # Meaning of Life, the Universe and Everything
-        prompt = [opt.prompt]
-        image = model(prompt=prompt, height=opt.res, width=opt.res).images
+                img.save(os.path.join(sample_path, f"{batch_idx[j]}.png"))
+        dist.barrier()
+        if is_main_process:
+            logging.info(f"Parallel generation complete. Samples are in:\n{outpath}")
+    elif is_main_process:
+        sample_path = os.path.join(outpath, sp)
+        os.makedirs(sample_path, exist_ok=True)
+        base_count = len(os.listdir(sample_path))
+        grid_count = len(os.listdir(outpath)) - 1
 
-        for j, img in enumerate(image):
-            img.save(os.path.join(sample_path, f"{j}.png"))
-        #toc = time.time()
+        # write config out
+        sampling_file = os.path.join(outpath, "sampling_config.yaml")
+        sampling_conf = vars(opt)
+        with open(sampling_file, 'a+') as f:
+            yaml.dump(sampling_conf, f, default_flow_style=False)
+        if opt.verbose:
+            logger.info("UNet model")
+            logger.info(model.model)
 
-    logging.info(f"Your samples are ready and waiting for you here: \n{outpath} \n"
-          f" \nEnjoy.")
+        #start_code = None
+        #if opt.fixed_code:
+        #    start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
+        batch_size = opt.n_samples
+        if opt.prompt is None:
+            for i in tqdm(range(0, pes.shape[0], batch_size), desc="data"):
+                torch.manual_seed(42) # Meaning of Life, the Universe and Everything
+                prompt_embeds = pes[i:i + batch_size].to(device)
+                image = model(prompt=None, negative_prompt=None,
+                            prompt_embeds=prompt_embeds,
+                            prompt_attention_mask = pams[i:i + batch_size].to(device),
+                            negative_prompt_embeds = npe.expand(prompt_embeds.shape[0], -1, -1),
+                            negative_prompt_attention_mask = npam.expand(prompt_embeds.shape[0], -1),
+                            height=opt.res, width=opt.res).images
+
+                for j, img in enumerate(image):
+                    img.save(os.path.join(sample_path, f"{i+j}.png"))
+        else:
+            torch.manual_seed(42) # Meaning of Life, the Universe and Everything
+            prompt = [opt.prompt]
+            image = model(prompt=prompt, height=opt.res, width=opt.res).images
+
+            for j, img in enumerate(image):
+                img.save(os.path.join(sample_path, f"{j}.png"))
+
+        logging.info(f"Your samples are ready and waiting for you here: \n{outpath} \n"
+              f" \nEnjoy.")
+
+    finalize_parallel(use_ddp)
 
 
 if __name__ == "__main__":

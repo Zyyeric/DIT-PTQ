@@ -65,8 +65,6 @@ if __name__ == "__main__":
         transform=coco_transform,
     )
 
-    # NOTE this controlled #images, for debugging purposes
-    #num_images, batch_size = 1024, 1
     num_images, batch_size = 128, 1
     coco_ds.ids = coco_ds.ids[-num_images:] # To ensure some difference...
 
@@ -82,7 +80,6 @@ if __name__ == "__main__":
     assert(all_uncond_pe == all_pe)
     with torch.no_grad():
 
-        # Upon Negar's suggestion, computing this early.
         latents_list = []
         for img_info in coco_dl:
             image_sample = torch.cat([img[0].unsqueeze(0) for img in img_info], axis=0)
@@ -95,7 +92,6 @@ if __name__ == "__main__":
         #print(noise.shape)
 
         for ts in timestep_list:
-            os.environ['CURL_CA_BUNDLE'] = '/etc/ssl/certs/ca-certificates.crt'
             loss = 0
             #qnn = QuantModel(deepcopy(pipeline.transformer), weight_quant_params=wq_params, act_quant_params=aq_params, act_quant_mode="qdiff", sm_abit=16)
             #qnn.cuda()

@@ -5,7 +5,12 @@ from qdiff.quant_layer import QuantModule, StraightThrough, lp_loss
 from qdiff.quant_model import QuantModel
 from qdiff.block_recon import LinearTempDecay
 from qdiff.adaptive_rounding import AdaRoundQuantizer
-from qdiff.utils import save_grad_data, save_inp_oup_data
+from qdiff.utils import (
+    save_grad_data,
+    save_inp_oup_data,
+    sync_grads,
+    get_dist_rank,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,10 +99,13 @@ def layer_reconstruction(model: QuantModel, layer: QuantModule, cali_data: torch
     else:
         cached_grads = None
     device = 'cuda'
+    rank = get_dist_rank()
+    rng = torch.Generator(device='cpu')
+    rng.manual_seed(1337 + rank)
 
     layer = layer.to(device, torch.float32)
     for i in range(iters):
-        idx = torch.randperm(cached_inps.size(0))[:batch_size]
+        idx = torch.randperm(cached_inps.size(0), generator=rng)[:batch_size]
         cur_inp = cached_inps[idx].to(device)
         cur_out = cached_outs[idx].to(device)
         cur_grad = cached_grads[idx] if opt_mode != 'mse' else None
@@ -107,11 +115,8 @@ def layer_reconstruction(model: QuantModel, layer: QuantModule, cali_data: torch
 
         err = loss_func(out_quant, cur_out, cur_grad)
         err.backward()
-        #if torch.cuda.device_count() > 1:
         if multi_gpu:
-            raise NotImplementedError
-            #for p in opt_params:
-            #    link.allreduce(p.grad)
+            sync_grads(opt_params)
         optimizer.step()
         if scheduler:
             scheduler.step()

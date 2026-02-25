@@ -5,7 +5,12 @@ from qdiff.quant_layer import QuantModule, StraightThrough, lp_loss
 from qdiff.quant_model import QuantModel
 from qdiff.quant_block import BaseQuantBlock
 from qdiff.adaptive_rounding import AdaRoundQuantizer
-from qdiff.utils import save_grad_data, save_inp_oup_data
+from qdiff.utils import (
+    save_grad_data,
+    save_inp_oup_data,
+    sync_grads,
+    get_dist_rank,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,13 +139,16 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
     else:
         cached_grads = None
     device = 'cuda'
+    rank = get_dist_rank()
+    rng = torch.Generator(device='cpu')
+    rng.manual_seed(2024 + rank)
 
     block = block.to(device, torch.float32)
     # NOTE Edit by Keith
     if optimizer is not None:
         for i in range(iters):
             if isinstance(cached_inps, list):
-                idx = torch.randperm(cached_inps[0].size(0))[:batch_size]
+                idx = torch.randperm(cached_inps[0].size(0), generator=rng)[:batch_size]
                 if len(cached_inps) == 8:
                     cur_x = cached_inps[0][idx].to(device, torch.float32)
                     cur_am = cached_inps[1][idx].to(device, torch.float32) if type(cached_inps[1]) == torch.Tensor else None
@@ -156,7 +164,7 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
                     cur_t = cached_inps[1][idx].to(device)
                     cur_inp = (cur_x, cur_t)
             else:
-                idx = torch.randperm(cached_inps.size(0))[:batch_size]
+                idx = torch.randperm(cached_inps.size(0), generator=rng)[:batch_size]
                 cur_inp = cached_inps[idx].to(device)
             cur_out = cached_outs[idx].to(device)
             cur_grad = cached_grads[idx].to(device) if opt_mode != 'mse' else None
@@ -172,11 +180,8 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
 
             err = loss_func(out_quant, cur_out, cur_grad)
             err.backward()
-            #if torch.cuda.device_count() > 1:
             if multi_gpu:
-                raise NotImplementedError
-                #for p in opt_params:
-                #    link.allreduce(p.grad)
+                sync_grads(opt_params)
             optimizer.step()
             if scheduler:
                 scheduler.step()

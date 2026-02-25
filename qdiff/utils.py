@@ -8,6 +8,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from qdiff.quant_layer import QuantModule, UniformAffineQuantizer
 from qdiff.quant_block import BaseQuantBlock, QuantDiffBTB, QuantDiffRB
 from qdiff.quant_model import QuantModel
@@ -15,6 +16,33 @@ from qdiff.adaptive_rounding import AdaRoundQuantizer
 from qdiff.quant_layer import UniformAffineQuantizer
 
 logger = logging.getLogger(__name__)
+
+
+def is_dist_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_dist_rank() -> int:
+    if not is_dist_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def get_dist_world_size() -> int:
+    if not is_dist_initialized():
+        return 1
+    return dist.get_world_size()
+
+
+def sync_grads(opt_params):
+    if not is_dist_initialized():
+        return
+    world_size = get_dist_world_size()
+    for p in opt_params:
+        if p.grad is None:
+            continue
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        p.grad.div_(world_size)
 
 
 def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBlock], cali_data: torch.Tensor,
@@ -646,6 +674,9 @@ def greedy_core_set_selection(unique_points, size, dist_func, verbose=True):
 def pixart_alpha_aca_dict(x):
     bs = x.shape[0]
     hw = x.shape[2] * 8
-    return {'resolution': torch.Tensor([[hw, hw]]).expand(bs, -1).to("cuda:0", torch.float16),
-            'aspect_ratio': torch.Tensor([[1.]]).expand(bs, -1).to("cuda:0", torch.float16)
-            }
+    device = x.device
+    dtype = x.dtype if torch.is_floating_point(x) else torch.float16
+    return {
+        'resolution': torch.tensor([[hw, hw]], device=device, dtype=dtype).expand(bs, -1),
+        'aspect_ratio': torch.tensor([[1.0]], device=device, dtype=dtype).expand(bs, -1),
+    }

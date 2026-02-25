@@ -139,7 +139,6 @@ class QuantModel(nn.Module):
                 m.set_quant_state(weight_quant, act_quant)
 
     def forward(self, x, timesteps=None, context=None):
-        #print("Forward called")
         return self.model(x, timesteps, context)
     
     def forward_diffusers(self, latent_model_input,
@@ -149,7 +148,6 @@ class QuantModel(nn.Module):
                     added_cond_kwargs,
                     return_dict=False,
                 ):
-        #print("Forward called")
         return self.model(
             sample=latent_model_input, 
             timestep=t, 
@@ -211,9 +209,6 @@ class QuantModelSelect(nn.Module):
             self.image_size = model.image_size
         self.specials = get_specials(act_quant_params['leaf_param'])
 
-        #for name, child_module in model.named_modules():
-        #    print(name)
-
         # Hacked changes for SDXL
         self.dtype=model.dtype
         if hasattr(model, "config"):
@@ -221,8 +216,6 @@ class QuantModelSelect(nn.Module):
             self.forward = self.forward_diffusers
         if hasattr(model, "add_embedding"):
             self.add_embedding = model.add_embedding
-            #self.in_features = model.in_features
-
 
         self.quant_module_refactor(self.model, target_module, weight_quant_params, act_quant_params)
         self.quant_block_refactor(self.model, weight_quant_params, act_quant_params)
@@ -348,9 +341,6 @@ class QuantModelMultiQ(nn.Module):
         if hasattr(model, 'image_size'):
             self.image_size = model.image_size
         self.specials = get_specials(act_quant_params['leaf_param'])
-
-        #for name, child_module in model.named_modules():
-        #    print(name)
 
         # Hacked changes for SDXL
         if hasattr(model, "dtype"):
