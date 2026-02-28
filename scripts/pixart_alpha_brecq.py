@@ -16,17 +16,13 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch import autocast
 from contextlib import nullcontext
-
-from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.plms import PLMSSampler
 from qdiff import (
     QuantModel, QuantModule, BaseQuantBlock, 
     block_reconstruction, layer_reconstruction,
 )
 from qdiff.adaptive_rounding import AdaRoundQuantizer
 from qdiff.quant_layer import UniformAffineQuantizer
-from qdiff.utils import resume_cali_model, get_train_samples_custom, convert_adaround, pixart_alpha_aca_dict
+from qdiff.utils import resume_cali_model, get_train_samples_custom, convert_adaround, pixart_alpha_aca_dict, save_inp_oup_data
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers import DiTPipeline, DPMSolverMultistepScheduler
 from transformers import AutoFeatureExtractor
@@ -422,6 +418,25 @@ def main():
     help="Disable group weight quantization"
     )
     parser.add_argument(
+        "--weight_quant_method",
+        type=str,
+        default="mse",
+        choices=["max", "mse"],
+        help="scaling method for weight quantization"
+    )
+    parser.add_argument(
+        "--act_quant_method",
+        type=str,
+        default="mse",
+        choices=["max", "mse"],
+        help="scaling method for activation quantization"
+    )
+    parser.add_argument("--gptq", action="store_true", help="Use GPTQ for weight quantization")
+    parser.add_argument("--gptq_actorder", action="store_true", help="Use actorder in GPTQ")
+    parser.add_argument("--gptq_percdamp", type=float, default=0.01, help="Percent damping in GPTQ")
+    parser.add_argument("--gptq_groupsize", type=int, default=-1, help="Groupsize for GPTQ")
+    parser.add_argument("--gptq_blocksize", type=int, default=128, help="Blocksize for GPTQ")
+    parser.add_argument(
         "--parallelism",
         type=str,
         default="none",
@@ -516,7 +531,7 @@ def main():
 
     assert(opt.cond)
     if opt.ptq:
-        wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse', 'fp': True, 
+        wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': opt.weight_quant_method, 
                     'mantissa_bits': opt.weight_mantissa_bits,
                     'attn_weight_mantissa': opt.attn_weight_mantissa,
                     'ff_weight_mantissa': opt.ff_weight_mantissa,
@@ -525,7 +540,7 @@ def main():
                     'fp': (not opt.disable_fp_quant),
                     'group_quant': (not opt.disable_group_quant)
                     }
-        aq_params = {'n_bits': opt.act_bit, 'channel_wise': False, 'scale_method': 'mse', 'leaf_param':  opt.quant_act, 
+        aq_params = {'n_bits': opt.act_bit, 'channel_wise': False, 'scale_method': opt.act_quant_method, 'leaf_param':  opt.quant_act, 
                     'mantissa_bits': opt.act_mantissa_bits,
                     'asym_softmax': opt.asym_softmax,
                     'online_act_quant': (not opt.disable_online_act_quant),
@@ -634,9 +649,81 @@ def main():
                     else:
                         recon_model(module)
 
+            if opt.gptq:
+                from qdiff.gptq import GPTQ
+                logger.info("Starting GPTQ calibration...")
+                
+                def process_gptq(module, inp_data):
+                    sub_layers = {name: m for name, m in module.named_modules() if isinstance(m, QuantModule)}
+                    if len(sub_layers) == 0:
+                        return
+
+                    gptqs = {}
+                    for name, m in sub_layers.items():
+                        gptqs[name] = GPTQ(m)
+                        gptqs[name].quantizer = m.weight_quantizer
+                        
+                    def add_batch(name):
+                        def hook(module, input, output):
+                            gptqs[name].add_batch(input[0].data, output.data)
+                        return hook
+                        
+                    handles = []
+                    for name, m in sub_layers.items():
+                        handles.append(m.register_forward_hook(add_batch(name)))
+                        
+                    # Run forward pass
+                    bs = opt.cali_batch_size
+                    num_samples = inp_data[0].shape[0] if isinstance(inp_data, (list, tuple)) else inp_data.shape[0]
+                    
+                    with torch.no_grad():
+                        for i in range(0, num_samples, bs):
+                            if isinstance(inp_data, (list, tuple)):
+                                batch = []
+                                for x in inp_data:
+                                    if x is None:
+                                        batch.append(None)
+                                    elif isinstance(x, dict):
+                                        batch.append({k: v[i:i+bs].to(device) for k, v in x.items()})
+                                    else:
+                                        batch.append(x[i:i+bs].to(device))
+                                module(*batch)
+                            else:
+                                batch = inp_data[i:i+bs].to(device)
+                                module(batch)
+                            
+                    for h in handles:
+                        h.remove()
+                        
+                    for name, gptq in gptqs.items():
+                        logger.info(f"Quantizing {name} in block...")
+                        gptq.fasterquant(
+                            percdamp=opt.gptq_percdamp, 
+                            groupsize=opt.gptq_groupsize, 
+                            actorder=opt.gptq_actorder,
+                            blocksize=opt.gptq_blocksize
+                        )
+                        gptq.free()
+
+                for name, module in qnn.model.named_children():
+                    if isinstance(module, (QuantModule, BaseQuantBlock)):
+                        logger.info(f"Processing {name} with GPTQ...")
+                        inps, outs = save_inp_oup_data(
+                            qnn, module, cali_data, 
+                            asym=False, act_quant=opt.quant_act, 
+                            batch_size=opt.cali_batch_size, keep_gpu=False, 
+                            cond=opt.cond, is_sm=False
+                        )
+                        process_gptq(module, inps)
+                        del inps, outs
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
             if not opt.resume_w:
-                logger.info("Doing weight calibration")
-                recon_model(qnn)
+                if not opt.gptq:
+                    logger.info("Doing weight calibration (BRECQ)")
+                    recon_model(qnn)
+                
                 qnn.set_quant_state(weight_quant=True, act_quant=False)
                 if use_ddp:
                     dist.barrier()

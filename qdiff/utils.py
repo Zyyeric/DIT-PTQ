@@ -171,16 +171,22 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
     if not is_sm:
         # NOTE for error on this conditional, check if the above for-loop is actually executing it should go through a tqdm.
         # add self.data_saver.input_store[7] len should be 7 -> 8
-        if isinstance(cached_batches[0][0], tuple) and len(cached_batches[0][0]) == 8:
+        if isinstance(cached_batches[0][0], tuple) and len(cached_batches[0][0]) == 8:            
+            def cat_dicts(list_of_dicts):
+                if not list_of_dicts or list_of_dicts[0] is None:
+                    return None
+                keys = list_of_dicts[0].keys()
+                return {k: torch.cat([d[k] for d in list_of_dicts]) for k in keys}
+
             cached_inps = [
                 torch.cat([x[0][0] for x in cached_batches]),
-                torch.cat([x[0][1] for x in cached_batches]) if cached_batches[0][0][1] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][2] for x in cached_batches]) if cached_batches[0][0][2] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][3] for x in cached_batches]) if cached_batches[0][0][3] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][4] for x in cached_batches]) if cached_batches[0][0][4] is not None else [None] * len(cached_batches),
-                [x[0][5] for x in cached_batches],
-                torch.cat([x[0][6] for x in cached_batches]) if cached_batches[0][0][6] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][7] for x in cached_batches]) if cached_batches[0][0][7] is not None else [None] * len(cached_batches),
+                torch.cat([x[0][1] for x in cached_batches]) if cached_batches[0][0][1] is not None else None,
+                torch.cat([x[0][2] for x in cached_batches]) if cached_batches[0][0][2] is not None else None,
+                torch.cat([x[0][3] for x in cached_batches]) if cached_batches[0][0][3] is not None else None,
+                torch.cat([x[0][4] for x in cached_batches]) if cached_batches[0][0][4] is not None else None,
+                [x[0][5] for x in cached_batches] if cached_batches[0][0][5] is not None else None,
+                torch.cat([x[0][6] for x in cached_batches]) if cached_batches[0][0][6] is not None else None,
+                cat_dicts([x[0][7] for x in cached_batches]) if cached_batches[0][0][7] is not None else None,
             ]
         elif isinstance(cached_batches[0][0], tuple):
             cached_inps = [
