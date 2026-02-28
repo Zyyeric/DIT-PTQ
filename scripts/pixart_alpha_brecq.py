@@ -531,7 +531,7 @@ def main():
 
     assert(opt.cond)
     if opt.ptq:
-        wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': opt.weight_quant_method, 
+        wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': opt.weight_quant_method,
                     'mantissa_bits': opt.weight_mantissa_bits,
                     'attn_weight_mantissa': opt.attn_weight_mantissa,
                     'ff_weight_mantissa': opt.ff_weight_mantissa,
