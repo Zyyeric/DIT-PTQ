@@ -13,7 +13,6 @@ import time
 from pytorch_lightning import seed_everything
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from torch import autocast
 from contextlib import nullcontext
 
@@ -41,48 +40,20 @@ from transformers import AutoFeatureExtractor
 
 logger = logging.getLogger(__name__)
 
-# load safety model
+os.environ['CURL_CA_BUNDLE'] = '/etc/ssl/certs/ca-certificates.crt'
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
 safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
-
-
-LEAF_NVTX_SUFFIXES = {
-    ".attn1.to_out.0": "attn1.to_out",
-    ".attn2.to_out.0": "attn2.to_out",
-    ".ff.net.0.proj": "ff.net.0.proj",
-    ".attn1.to_q": "attn1.to_q",
-    ".attn1.to_k": "attn1.to_k",
-    ".attn1.to_v": "attn1.to_v",
-    ".attn2.to_q": "attn2.to_q",
-    ".attn2.to_k": "attn2.to_k",
-    ".attn2.to_v": "attn2.to_v",
-    ".ff.net.2": "ff.net.2",
-}
-
-PARENT_NVTX_SUFFIXES = {
-    ".attn1": "self_attn",
-    ".attn2": "cross_attn",
-    ".ff": "ffn",
-}
-
 
 def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
 
-
 def numpy_to_pil(images):
-    """
-    Convert a numpy image or a batch of images to a PIL image.
-    """
     if images.ndim == 3:
         images = images[None, ...]
     images = (images * 255).round().astype("uint8")
-    pil_images = [Image.fromarray(image) for image in images]
-
-    return pil_images
-
+    return [Image.fromarray(image) for image in images]
 
 def put_watermark(img, wm_encoder=None):
     if wm_encoder is not None:
@@ -90,7 +61,6 @@ def put_watermark(img, wm_encoder=None):
         img = wm_encoder.encode(img, 'dwtDct')
         img = Image.fromarray(img[:, :, ::-1])
     return img
-
 
 def load_replacement(x):
     try:
@@ -102,7 +72,6 @@ def load_replacement(x):
     except Exception:
         return x
 
-
 def check_safety(x_image):
     safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
     x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
@@ -112,35 +81,76 @@ def check_safety(x_image):
             x_checked_image[i] = load_replacement(x_checked_image[i])
     return x_checked_image, has_nsfw_concept
 
+# === ADDED: GPTQ CALIBRATION LOGIC ===
+def run_gptq_calibration(qnn, cali_xs, cali_ts, cali_cs, opt):
+    from qdiff.gptq import GPTQ, Quantizer_GPTQ
+    import gc
+    logger.info("Starting Memory-Safe GPTQ Calibration...")
+    
+    # 1. Group target layers by their top-level block/module to prevent OOM
+    # PixArt typically uses 'blocks.0', 'blocks.1', etc.
+    block_names = []
+    for name, module in qnn.named_modules():
+        if isinstance(module, QuantModule) and not module.ignore_reconstruction:
+            # Extract the root block name (e.g., 'blocks.0' or 'proj_in')
+            root_block = ".".join(name.split(".")[:2]) if "blocks" in name else name.split(".")[0]
+            if root_block not in block_names:
+                block_names.append(root_block)
 
-def init_parallel(parallelism: str, backend: str):
-    mode = parallelism.lower()
-    if mode == "dp":
-        mode = "ddp"
+    # 2. Run GPTQ sequentially, block-by-block
+    for block_name in block_names:
+        logger.info(f"Running GPTQ on block group: {block_name}...")
+        
+        # Find all QuantModules inside this specific block
+        subset_layers = {}
+        for name, module in qnn.named_modules():
+            if name.startswith(block_name) and isinstance(module, QuantModule) and not module.ignore_reconstruction:
+                subset_layers[name] = module
+                
+        if not subset_layers:
+            continue
 
-    if mode != "ddp":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return mode, False, 0, 0, 1, device
+        # Setup trackers for just this block
+        gptq_trackers = {}
+        handles = []
+        
+        for name, module in subset_layers.items():
+            gptq_trackers[name] = GPTQ(module)
+            gptq_trackers[name].quantizer = Quantizer_GPTQ()
+            gptq_trackers[name].quantizer.configure(
+                bits=opt.weight_bit, perchannel=True, sym=opt.w_sym, mse=False, 
+                channel_group=1, clip_ratio=opt.w_clip_ratio, quant_type="int"
+            )
+            
+            def add_batch(name):
+                def tmp(_, inp, out):
+                    gptq_trackers[name].add_batch(inp[0].data, out.data)
+                return tmp
+            handles.append(module.register_forward_hook(add_batch(name)))
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("--parallelism ddp requires CUDA.")
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        raise RuntimeError("--parallelism ddp must be launched with torchrun (RANK/WORLD_SIZE env vars missing).")
+        # Forward pass to populate Hessians for this block ONLY
+        qnn.eval()
+        with torch.no_grad():
+            for i in range(0, cali_xs.size(0), 2): # Batch size of 2 to keep activation memory low
+                qnn(cali_xs[i:i+2].cuda(), 
+                    timestep=cali_ts[i:i+2].cuda(), 
+                    encoder_hidden_states=cali_cs[i:i+2].cuda(), 
+                    added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[i:i+2]))
 
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend=backend, init_method="env://")
-    device = torch.device(f"cuda:{local_rank}")
-    return mode, True, rank, local_rank, world_size, device
+        # Remove hooks
+        for h in handles:
+            h.remove()
 
+        # Execute GPTQ update and free memory
+        for name, module in subset_layers.items():
+            gptq_trackers[name].fasterquant(percdamp=opt.percdamp, groupsize=opt.weight_group_size)
+            gptq_trackers[name].free()
+            
+        torch.cuda.empty_cache()
+        gc.collect()
 
-def finalize_parallel(use_ddp: bool):
-    if use_ddp and dist.is_available() and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
+    logger.info("GPTQ Calibration Complete!")
+# =====================================
 
 def is_transformer_block(name, module):
     return all(hasattr(module, attr) for attr in ("attn1", "ff", "norm1"))
@@ -221,20 +231,80 @@ def run_generation(pipeline, step_tracker: DenoisingStepTracker, enabled: bool, 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--prompt", type=str, default=None, help="the prompt to render")
+    parser.add_argument("--outdir", type=str, nargs="?", help="dir to write results to", default="outputs/txt2img-samples")
+    parser.add_argument("--skip_grid", action='store_true')
+    parser.add_argument("--skip_save", action='store_true')
+    parser.add_argument("--ddim_steps", type=int, default=20)
+    parser.add_argument("--plms", action='store_true')
+    parser.add_argument("--laion400m", action='store_true')
+    parser.add_argument("--fixed_code", action='store_true')
+    parser.add_argument("--ddim_eta", type=float, default=0.0)
+    parser.add_argument("--n_iter", type=int, default=1)
+    parser.add_argument("--res", type=int, default=512)
+    parser.add_argument("--C", type=int, default=4)
+    parser.add_argument("--f", type=int, default=8)
+    parser.add_argument("--n_samples", type=int, default=1)
+    parser.add_argument("--n_rows", type=int, default=0)
+    parser.add_argument("--scale", type=float, default=7.5)
+    parser.add_argument("--from-file", type=str)
+    parser.add_argument("--config", type=str, default="configs/stable-diffusion/v1-inference.yaml")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--precision", type=str, choices=["full", "autocast"], default="autocast")
+    
+    parser.add_argument("--ptq", action="store_true")
+    parser.add_argument("--quant_act", action="store_true")
+    parser.add_argument("--weight_bit", type=int, default=8)
+    parser.add_argument("--act_bit", type=int, default=8)
+    parser.add_argument("--quant_mode", type=str, default="symmetric", choices=["linear", "squant", "qdiff"])
+    parser.add_argument("--cali_st", type=int, default=20)
+    parser.add_argument("--cali_batch_size", type=int, default=8)
+    parser.add_argument("--cali_n", type=int, default=128)
+    parser.add_argument("--cali_iters", type=int, default=20000)
+    parser.add_argument('--cali_iters_a', default=5000, type=int)
+    parser.add_argument('--cali_lr', default=4e-4, type=float)
+    parser.add_argument('--cali_p', default=2.4, type=float)
+    parser.add_argument("--cali_ckpt", type=str)
+    parser.add_argument("--cali_data_path", type=str, default="pixart_calib_brecq.pt")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--adaround", action="store_true")
+    parser.add_argument("--resume_w", action="store_true")
+    parser.add_argument("--cond", action="store_true")
+    parser.add_argument("--no_grad_ckpt", action="store_true")
+    parser.add_argument("--split", action="store_true")
+    parser.add_argument("--running_stat", action="store_true")
+    parser.add_argument("--rs_sm_only", action="store_true")
+    parser.add_argument("--sm_abit",type=int, default=16)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--refiner", action="store_true", default=False)
+    parser.add_argument("--sequential_w", action="store_true", default=False)
+    parser.add_argument("--sequential_a", action="store_true", default=False)
+    parser.add_argument("--weight_mantissa_bits", type=int, default=None)
+    parser.add_argument("--act_mantissa_bits", type=int, default=None)
+    parser.add_argument("--no_adaround", action="store_true")
+    parser.add_argument("--attn_weight_mantissa", type=int, default=None)
+    parser.add_argument("--ff_weight_mantissa", type=int, default=None)
+    parser.add_argument("--asym_softmax", action="store_true", default=False)
+    parser.add_argument("--weight_group_size", type=int, default=128)
+    parser.add_argument("--no_fp_biased_adaround", action="store_false")
+    parser.add_argument("--disable_online_act_quant", action="store_true")
+    parser.add_argument("--coco_9k", action="store_true", default=False)
+    parser.add_argument("--coco_10k", action="store_true", default=False)
+    parser.add_argument("--coco2014", action="store_true", default=False)
+    parser.add_argument("--hpsv2", action="store_true", default=False)
+    parser.add_argument("--pixart", action="store_true", default=False)
+    parser.add_argument("--disable_fp_quant", action="store_true")
+    parser.add_argument("--disable_group_quant", action="store_true")
 
-    parser.add_argument(
-    "--prompt",
-    type=str,
-    default=None,
-    help="the prompt to render; if not provided, uses dataset captions"
-    )
-    parser.add_argument(
-        "--max_prompts",
-        type=int,
-        default=None,
-        help="limit number of caption prompts used for generation when --prompt is not set",
-    )
+    # === ADDED: Q-DIT CONFIGS ===
+    parser.add_argument("--w_clip_ratio", type=float, default=1.0)
+    parser.add_argument("--a_clip_ratio", type=float, default=1.0)
+    parser.add_argument("--w_sym", action="store_true")
+    parser.add_argument("--use_gptq", action="store_true")
+    parser.add_argument("--percdamp", type=float, default=0.01)
+    # ============================
 
+<<<<<<< HEAD
     parser.add_argument(
         "--outdir",
         type=str,
@@ -558,82 +628,44 @@ def main():
         action="store_true",
         help="Add NVTX ranges for generation, denoising steps, transformer blocks, attention, and FFN projections.",
     )
+=======
+>>>>>>> 99631dd (compare INT4 vs FP4 side-by-side)
     opt = parser.parse_args()
-    parallel_mode, use_ddp, rank, local_rank, world_size, device = init_parallel(
-        opt.parallelism, opt.ddp_backend
-    )
-    is_main_process = rank == 0
-    do_parallel_generate = use_ddp and opt.parallel_generate and opt.prompt is None
-
-    seed_everything(opt.seed + rank)
+    seed_everything(opt.seed)
 
     os.makedirs(opt.outdir, exist_ok=True)
-    run_tag = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S") if is_main_process else None
-    if use_ddp:
-        obj_list = [run_tag]
-        dist.broadcast_object_list(obj_list, src=0)
-        run_tag = obj_list[0]
-    outpath = os.path.join(opt.outdir, run_tag)
-    if is_main_process:
-        os.makedirs(outpath, exist_ok=True)
-    if use_ddp:
-        dist.barrier()
+    outpath = os.path.join(opt.outdir, datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
+    os.makedirs(outpath)
 
     log_path = os.path.join(outpath, "run.log")
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
         level=logging.INFO,
-        handlers=(
-            [logging.FileHandler(log_path), logging.StreamHandler()]
-            if is_main_process
-            else [logging.StreamHandler()]
-        )
+        handlers=[logging.FileHandler(log_path), logging.StreamHandler()]
     )
     logger = logging.getLogger(__name__)
-    logger.info(f"parallelism={parallel_mode}, world_size={world_size}, rank={rank}, local_rank={local_rank}")
-    if use_ddp and opt.parallel_generate and opt.prompt is not None and is_main_process:
-        logger.info("--parallel_generate is ignored when --prompt is provided (single prompt path).")
-
 
     from diffusers import PixArtAlphaPipeline
-    model = PixArtAlphaPipeline.from_pretrained(
-        "PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=torch.float16
-    ).to(device)
+    model = PixArtAlphaPipeline.from_pretrained("PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=torch.float16).to("cuda")
 
     from qdiff.caption_util import get_captions
-    pes, pams, npe, npam = None, None, None, None
-    if opt.prompt is None and (is_main_process or do_parallel_generate):
-        pes, pams, npe, npam = get_captions("alpha", model, 
-                            coco_9k=opt.coco_9k,
-                            coco_10k=opt.coco_10k,
-                            coco2014=opt.coco2014,
-                            hpsv2=opt.hpsv2,
-                            pixart=opt.pixart)
-        if opt.max_prompts is not None:
-            if opt.max_prompts <= 0:
-                raise ValueError("--max_prompts must be a positive integer")
-            n_prompts = min(opt.max_prompts, pes.shape[0])
-            logger.info(f"Using {n_prompts} prompts out of {pes.shape[0]} available prompts")
-            pes = pes[:n_prompts]
-            pams = pams[:n_prompts]
+    if opt.prompt is None:
+        pes, pams, npe, npam = get_captions("alpha", model, coco_9k=opt.coco_9k, coco_10k=opt.coco_10k, coco2014=opt.coco2014, hpsv2=opt.hpsv2, pixart=opt.pixart)
         model.text_encoder = model.text_encoder.to("cpu")
 
-    if opt.coco_9k:
-        sp = "samples_9k"
-    elif opt.coco_10k:
-        sp = "samples_10k"
-    elif opt.pixart:
-        sp = "samples_pixart"
-    elif opt.coco2014:
-        sp = "samples_2014"
-    elif opt.hpsv2:
-        sp = 'samples_hpsv2'
-    else:
-        sp = "samples"
+    if opt.coco_9k: sp = "samples_9k"
+    elif opt.coco_10k: sp = "samples_10k"
+    elif opt.pixart: sp = "samples_pixart"
+    elif opt.coco2014: sp = "samples_2014"
+    elif opt.hpsv2: sp = 'samples_hpsv2'
+    else: sp = "samples"
 
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     assert(opt.cond)
+
     if opt.ptq:
+<<<<<<< HEAD
         if opt.weight_only and opt.act_only:
             raise ValueError("--weight_only and --act_only are mutually exclusive")
         if opt.resume_w and opt.act_only:
@@ -659,17 +691,45 @@ def main():
                     'online_act_quant': (not opt.disable_online_act_quant),
                     'fp': (not opt.disable_fp_quant)
                     }
+=======
+        # === UPDATED: WQ AND AQ PARAMS WITH Q-DIT INTEGRATION ===
+        wq_params = {
+            'n_bits': opt.weight_bit, 
+            'channel_wise': True, 
+            'scale_method': 'mse', 
+            'mantissa_bits': opt.weight_mantissa_bits,
+            'attn_weight_mantissa': opt.attn_weight_mantissa,
+            'ff_weight_mantissa': opt.ff_weight_mantissa,
+            'weight_group_size': opt.weight_group_size,
+            'fp_biased_adaround': opt.no_fp_biased_adaround,
+            'group_quant': (not opt.disable_group_quant),
+            'fp': (not opt.disable_fp_quant), 
+            'sym': opt.w_sym,
+            'clip_ratio': opt.w_clip_ratio
+        }
+        aq_params = {
+            'n_bits': opt.act_bit, 
+            'channel_wise': False, 
+            'scale_method': 'mse', 
+            'leaf_param': opt.quant_act, 
+            'mantissa_bits': opt.act_mantissa_bits,
+            'online_act_quant': (not opt.disable_online_act_quant),
+            'fp': (not opt.disable_fp_quant),
+            'sym': opt.asym_softmax,
+            'clip_ratio': opt.a_clip_ratio
+        }
+        # ========================================================
+
+>>>>>>> 99631dd (compare INT4 vs FP4 side-by-side)
         if opt.resume:
             logger.info('Load with min-max quick initialization')
             wq_params['scale_method'] = 'max'
             aq_params['scale_method'] = 'max'
         if opt.resume_w:
             wq_params['scale_method'] = 'max'
-        qnn = QuantModel(
-            model=model.transformer, weight_quant_params=wq_params, act_quant_params=aq_params,
-            act_quant_mode="qdiff", sm_abit=opt.sm_abit)
-        #exit(0)
-        qnn.to(device)
+
+        qnn = QuantModel(model=model.transformer, weight_quant_params=wq_params, act_quant_params=aq_params, act_quant_mode="qdiff", sm_abit=opt.sm_abit)
+        qnn.to("cuda")
         qnn.eval()
 
         if opt.no_grad_ckpt:
@@ -677,10 +737,6 @@ def main():
             qnn.set_grad_ckpt(False)
 
         if opt.resume:
-            #noisy_latents = torch.randn(1, 4, 64, 64, dtype=torch.float16) #.cuda()
-            #timesteps = torch.zeros(1).long() #.cuda()
-            #class_labels = torch.tensor(list(range(1))) #.cuda()
-            #cali_data = (noisy_latents, timesteps, class_labels)
             sample_data = torch.load(opt.cali_data_path)
             cali_data = get_train_samples_custom(opt, sample_data, opt.ddim_steps)
             resume_cali_model(
@@ -689,23 +745,12 @@ def main():
             )
         else:
             logger.info(f"Sampling data from {opt.cali_st} timesteps for calibration")
-            
-            sample_data = torch.load(opt.cali_data_path)  # This is de-commented when needed
-        
-            # [step, batch_size * 2, in_channel, height, width] of the noise latent image
-            #noisy_latents = torch.randn(opt.ddim_steps, 32, 4, 64, 64, dtype=torch.float16) #.cuda()
-            #timesteps = torch.zeros(opt.ddim_steps, 32).long() #.cuda()
-            #class_labels = torch.zeros(opt.ddim_steps, 32, 120, 4096) #.cuda()
-            #sample_data = {'xs': noisy_latents, #[2, 4, 64, 64]
-            #            'ts': timesteps,
-            #            'cs': class_labels} #[2, 120, 4096]
-
+            sample_data = torch.load(opt.cali_data_path)
             sample_data['xs'] = sample_data['xs'].to(torch.float16)
             sample_data['cs'] = sample_data['cs'].to(torch.float16)
             cali_data = get_train_samples_custom(opt, sample_data, opt.ddim_steps)
             del(sample_data)
             gc.collect()
-            logger.info(f"Calibration data shape: {cali_data[0].shape} {cali_data[1].shape} {cali_data[2].shape}")
 
             cali_xs, cali_ts, cali_cs = cali_data
             if opt.resume_w:
@@ -719,6 +764,7 @@ def main():
                 else:
                     logger.info("Skipping weight quantization; activations will be calibrated against FP16/BF16 weights")
 
+<<<<<<< HEAD
             qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=False)
 
             #print(qnn)
@@ -738,39 +784,26 @@ def main():
                     iters=opt.cali_iters, weight=0.01, asym=True, b_range=(20, 2),
                     warmup=0.2, act_quant=False, opt_mode='mse', cond=opt.cond, sequential=opt.sequential_w,
                     no_adaround=opt.no_adaround, multi_gpu=use_ddp, weight_quant=enable_weight_quant)
+=======
+            qnn.set_quant_state(weight_quant=True, act_quant=False)
+            _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
+            logger.info("Initializing has done!")
+
+            kwargs = dict(cali_data=cali_data, batch_size=opt.cali_batch_size, iters=opt.cali_iters, weight=0.01, asym=True, b_range=(20, 2), warmup=0.2, act_quant=False, opt_mode='mse', cond=opt.cond, sequential=opt.sequential_w, no_adaround=opt.no_adaround)
+>>>>>>> 99631dd (compare INT4 vs FP4 side-by-side)
         
             def recon_model(model):
-                """
-                Block reconstruction. For the first and last layers, we can only apply layer reconstruction.
-                """
                 for name, module in model.named_children():
-                    logger.info(f"{name} {isinstance(module, BaseQuantBlock)}")
-                    """
-                    if name == 'output_blocks':
-                        logger.info("Finished calibrating input and mid blocks, saving temporary checkpoint...")
-                        in_recon_done = True
-                        torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
-                    if name.isdigit() and int(name) >= 9:
-                        logger.info(f"Saving temporary checkpoint at {name}...")
-                        torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
-                    """
                     if isinstance(module, QuantModule):
-                        if module.ignore_reconstruction is True:
-                            logger.info('Ignore reconstruction of layer {}'.format(name))
-                            continue
-                        else:
-                            logger.info('Reconstruction for layer {}'.format(name))
-                            layer_reconstruction(qnn, module, **kwargs)
+                        if module.ignore_reconstruction is True: continue
+                        else: layer_reconstruction(qnn, module, **kwargs)
                     elif isinstance(module, BaseQuantBlock):
-                        if module.ignore_reconstruction is True:
-                            logger.info('Ignore reconstruction of block {}'.format(name))
-                            continue
-                        else:
-                            logger.info('Reconstruction for block {}'.format(name))
-                            block_reconstruction(qnn, module, **kwargs)
+                        if module.ignore_reconstruction is True: continue
+                        else: block_reconstruction(qnn, module, **kwargs)
                     else:
                         recon_model(module)
 
+<<<<<<< HEAD
             if enable_weight_quant and not opt.resume_w:
                 logger.info("Doing weight calibration")
                 recon_model(qnn)
@@ -778,6 +811,23 @@ def main():
                 if use_ddp:
                     dist.barrier()
                 # NOTE Checkpoint weight quantization calibation separately
+=======
+            if not opt.resume_w:
+                # === UPDATED: ROUTING LOGIC ===
+                if opt.use_gptq:
+                    run_gptq_calibration(qnn, cali_xs, cali_ts, cali_cs, opt)
+                    # Tell native quantizers to just pass the modified weights through directly
+                    for name, module in qnn.named_modules():
+                        if isinstance(module, QuantModule):
+                            module.weight_quantizer.scale_method = 'max' 
+                    qnn.set_quant_state(weight_quant=True, act_quant=False)
+                else:
+                    logger.info("Doing AdaRound weight calibration")
+                    recon_model(qnn)
+                    qnn.set_quant_state(weight_quant=True, act_quant=False)
+                # ==============================
+
+>>>>>>> 99631dd (compare INT4 vs FP4 side-by-side)
                 logger.info("Saving calibrated quantized UNet model")
                 for m in qnn.model.modules():
                     if isinstance(m, AdaRoundQuantizer):
@@ -789,6 +839,7 @@ def main():
                                 m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                             else:
                                 m.zero_point = nn.Parameter(m.zero_point)
+<<<<<<< HEAD
                 if is_main_process:
                     torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt_wq.pth"))
                 logger.info(model.transformer)
@@ -798,19 +849,22 @@ def main():
                 logger.info("Doing activation calibration")
                 # Initialize activation quantization parameters
                 qnn.set_quant_state(enable_weight_quant, True)
+=======
+                torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt_wq.pth"))
+
+            if opt.quant_act and opt.disable_online_act_quant:
+                logger.info("Doing activation calibration")
+                qnn.set_quant_state(True, True)
+>>>>>>> 99631dd (compare INT4 vs FP4 side-by-side)
                 with torch.no_grad():
                     inds = np.random.choice(cali_xs.shape[0], 16, replace=False)
-                    _ = qnn(
-                        cali_xs[inds],
-                        timestep=cali_ts[inds],
-                        encoder_hidden_states=cali_cs[inds],
-                        added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[inds]),
-                    )
+                    _ = qnn(cali_xs[inds].cuda(), timestep=cali_ts[inds].cuda(), encoder_hidden_states=cali_cs[inds].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[inds]))
                     if opt.running_stat:
                         logger.info('Running stat for activation quantization')
                         inds = np.arange(cali_xs.shape[0])
                         np.random.shuffle(inds)
                         qnn.set_running_stat(True, opt.rs_sm_only)
+<<<<<<< HEAD
                         for i in trange(int(cali_xs.size(0) / 16), disable=opt.nvtx_profile):
                             _ = qnn(
                                 cali_xs[inds[i * 16:(i + 1) * 16]],
@@ -838,6 +892,18 @@ def main():
                 if isinstance(m, QuantModule):
                     m.report_delta_shift()
             """
+=======
+                        for i in trange(int(cali_xs.size(0) / 16)):
+                            _ = qnn(cali_xs[inds[i * 16:(i + 1) * 16]].cuda(), timestep=cali_ts[inds[i * 16:(i + 1) * 16]].cuda(), encoder_hidden_states=cali_cs[inds[i * 16:(i + 1) * 16]].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[inds[i * 16:(i + 1) * 16]]))
+                        qnn.set_running_stat(False, opt.rs_sm_only)
+
+                kwargs = dict(cali_data=cali_data, batch_size=opt.cali_batch_size, iters=opt.cali_iters_a, act_quant=True, opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p, cond=opt.cond, sequential=opt.sequential_a)
+                recon_model(qnn)
+                qnn.set_quant_state(weight_quant=True, act_quant=True)
+            elif opt.quant_act:
+                logger.info("Doing online activation calibration")
+                qnn.set_quant_state(weight_quant=True, act_quant=True)
+>>>>>>> 99631dd (compare INT4 vs FP4 side-by-side)
             
             logger.info("Saving calibrated quantized UNet model")
             for m in qnn.model.modules():
@@ -850,9 +916,8 @@ def main():
                             m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                         else:
                             m.zero_point = nn.Parameter(m.zero_point)
-            #torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
 
-        qnn = qnn.to(device=device, dtype=torch.float16)
+        qnn = qnn.to('cuda', dtype=torch.float16)
         model.transformer = qnn
 
     if opt.nvtx_profile:
@@ -860,11 +925,15 @@ def main():
 
     step_tracker = install_nvtx_instrumentation(model, opt.nvtx_profile)
     
-    #model.text_encoder = model.text_encoder.to("cuda")
+    sample_path = os.path.join(outpath, sp)
+    os.makedirs(sample_path, exist_ok=True)
 
-    if use_ddp:
-        dist.barrier()
+    sampling_file = os.path.join(outpath, "sampling_config.yaml")
+    sampling_conf = vars(opt)
+    with open(sampling_file, 'a+') as f:
+        yaml.dump(sampling_conf, f, default_flow_style=False)
 
+<<<<<<< HEAD
     if do_parallel_generate:
         sample_path = os.path.join(outpath, sp)
         if is_main_process:
@@ -965,7 +1034,29 @@ def main():
               f" \nEnjoy.")
 
     finalize_parallel(use_ddp)
+=======
+    batch_size = opt.n_samples
+    if opt.prompt is None:
+        for i in tqdm(range(0, pes.shape[0], batch_size), desc="data"):
+            torch.manual_seed(42)
+            prompt_embeds = pes[i:i + batch_size].to("cuda")
+            image = model(prompt=None, negative_prompt=None,
+                        prompt_embeds=prompt_embeds,
+                        prompt_attention_mask = pams[i:i + batch_size].to("cuda"),
+                        negative_prompt_embeds = npe.expand(prompt_embeds.shape[0], -1, -1),
+                        negative_prompt_attention_mask = npam.expand(prompt_embeds.shape[0], -1),
+                        height=opt.res, width=opt.res).images
+            for j, img in enumerate(image):
+                img.save(os.path.join(sample_path, f"{i+j}.png"))
+    else:
+        torch.manual_seed(42)
+        prompt = [opt.prompt]
+        image = model(prompt=prompt, height=opt.res, width=opt.res).images
+        for j, img in enumerate(image):
+            img.save(os.path.join(sample_path, f"{j}.png"))
+>>>>>>> 99631dd (compare INT4 vs FP4 side-by-side)
 
+    logging.info(f"Your samples are ready and waiting for you here: \n{outpath} \nEnjoy.")
 
 if __name__ == "__main__":
     main()
