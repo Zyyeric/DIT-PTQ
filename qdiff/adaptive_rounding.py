@@ -32,6 +32,16 @@ class AdaRoundQuantizer(nn.Module):
         
         if hasattr(uaq, 'maxval'):
             self.maxval = uaq.maxval
+        elif self.fp:
+            self.maxval = uaq.delta
+
+        # === REQUIRED FIX: Inherit grouped attributes for init_alpha ===
+        if hasattr(uaq, 'group_quant'):
+            self.group_quant = uaq.group_quant
+            self.group_size = uaq.group_size
+        if hasattr(uaq, 'fp_biased_adaround'):
+            self.fp_biased_adaround = uaq.fp_biased_adaround
+        # ===============================================================
 
         self.round_mode = round_mode
         self.alpha = None
@@ -40,14 +50,24 @@ class AdaRoundQuantizer(nn.Module):
         # params for sigmoid function
         self.gamma, self.zeta = -0.1, 1.1
         self.beta = 2/3
+        # Initialize alpha (this will now correctly use group_quant if enabled)
         self.init_alpha(x=weight_tensor.clone())
 
     def forward(self, x):
+        # === REQUIRED FIX: Handle group quantization shapes in forward pass ===
+        x_shape_old = x.shape
+        if hasattr(self, 'group_quant') and self.group_quant:
+            x = x.view(-1, self.group_size)
+        # ======================================================================
+
         if self.fp:
             # Native FP4 optimization
             x_dequant = quantize_to_fp8_ste_MM_soft_targets(
                 x, self.n_bits, self.delta, self.mantissa_bits, self.sign_bits, self.get_soft_targets()
             )
+            
+            if hasattr(self, 'group_quant') and self.group_quant:
+                x_dequant = x_dequant.view(x_shape_old)
             return x_dequant
         else:
             # Standard INT rounding
@@ -61,6 +81,8 @@ class AdaRoundQuantizer(nn.Module):
             x_quant = torch.clamp(x_int + self.zero_point, self.q_min, self.q_max)
             x_float_q = (x_quant - self.zero_point) * self.delta
             
+            if hasattr(self, 'group_quant') and self.group_quant:
+                x_float_q = x_float_q.view(x_shape_old)
             return x_float_q
 
     def get_soft_targets(self):
