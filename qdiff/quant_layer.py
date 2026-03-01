@@ -12,20 +12,31 @@ logger = logging.getLogger(__name__)
 class StraightThrough(nn.Module):
     def __init__(self, channel_num: int = 1):
         super().__init__()
+
     def forward(self, input):
         return input
 
 def round_ste(x: torch.Tensor):
+    """
+    Implement Straight-Through Estimator for rounding operation.
+    """
     return (x.round() - x).detach() + x
 
 def lp_loss(pred, tgt, p=2.0, reduction='none'):
+    """
+    loss function measured in L_p Norm
+    """
     if reduction == 'none':
         return (pred-tgt).abs().pow(p).sum(1).mean()
     else:
         return (pred-tgt).abs().pow(p).mean()
 
 class UniformAffineQuantizer(nn.Module):
-    # === UPDATED: Added clip_ratio, removed n_levels, added q_max/q_min ===
+    """
+    PyTorch Function that can be used for asymmetric quantization (also called uniform affine
+    quantization). Quantizes its argument in the forward pass, passes the gradient 'straight
+    through' on the backward pass, ignoring the quantization that occurred.
+    """
     def __init__(self, n_bits: int = 8, symmetric: bool = False, channel_wise: bool = False, scale_method: str = 'max',
                  leaf_param: bool = False, always_zero: bool = False, fp: bool = False, mantissa_bits: int = None, 
                  weight_group_size: int = None, fp_biased_adaround: bool = True, 
@@ -35,6 +46,10 @@ class UniformAffineQuantizer(nn.Module):
         self.n_bits = n_bits
         self.clip_ratio = clip_ratio
         
+        # === THE BRIDGE: Retain n_levels so FP4 AdaRound doesn't crash ===
+        self.n_levels = 2 ** self.n_bits if not self.sym else 2 ** (self.n_bits - 1) - 1
+        
+        # === Q-DiT INT Bounds: Exact min/max ranges ===
         if self.sym:
             self.q_max = (2**(self.n_bits-1)-1)
             self.q_min = (-2**(self.n_bits-1))
@@ -114,8 +129,9 @@ class UniformAffineQuantizer(nn.Module):
         if self.fp == True:
             if (self.leaf_param == True) and (self.dynamic_idx != None):
                 x_dequant = quantize_to_fp8_ste_MM(x, self.n_bits, self.delta[self.dynamic_idx], self.dynamic_mantissa[self.dynamic_idx], self.sign_bits)
-
-            x_dequant = quantize_to_fp8_ste_MM(x, self.n_bits, self.delta, self.mantissa_bits, self.sign_bits)
+            else:
+                x_dequant = quantize_to_fp8_ste_MM(x, self.n_bits, self.delta, self.mantissa_bits, self.sign_bits)
+            
             if self.group_quant == True:
                 x_dequant = x_dequant.view(x_old.shape)
             return x_dequant
@@ -130,10 +146,14 @@ class UniformAffineQuantizer(nn.Module):
         elif "quantile" in self.scale_method:
             return self.dequant_kmeans(x)
 
-        # === UPDATED: Forward integer calculation (Q-DiT mapping) ===
+        # === Q-DIT INT FORWARD PASS ===
         x_int = round_ste(x / self.delta) + self.zero_point
         x_quant = torch.clamp(x_int, self.q_min, self.q_max)
         x_dequant = (x_quant - self.zero_point) * self.delta
+        
+        if self.group_quant == True:
+            x_dequant = x_dequant.view(x_old.shape)
+            
         return x_dequant
 
     def act_momentum_update(self, x: torch.Tensor, act_range_momentum: float = 0.95):
@@ -200,7 +220,6 @@ class UniformAffineQuantizer(nn.Module):
             x_max = max(abs(x_max), abs(x_min))
             delta = x_max
             zero_point = torch.zeros(1)
-            delta, zero_point = delta, torch.zeros(1)
         return delta, zero_point
 
     def init_quantization_scale(self, x: torch.Tensor, channel_wise: bool = False, print_stats=False):
@@ -254,7 +273,7 @@ class UniformAffineQuantizer(nn.Module):
                 zero_point = round(-x_min / delta) if not (self.sym or self.always_zero) else 0
                 delta = torch.tensor(delta).type_as(x)
 
-            # === UPDATED: Granular MSE search mapped from Q-DiT ===
+            # === Q-DIT MSE GRID SEARCH ===
             elif self.scale_method == 'mse':
                 w_max = x.max()
                 w_min = x.min()
@@ -293,7 +312,25 @@ class UniformAffineQuantizer(nn.Module):
                     zero_point = max(min(zero_point, self.q_max), self.q_min)
 
                 delta = torch.tensor(delta).type_as(x)
-            # ======================================================
+            
+            # === RESTORED EXPERIMENTAL METHODS ===
+            elif self.scale_method == 'kmeans':
+                from sklearn.cluster import KMeans
+                x_np = x.clone().detach().cpu().view(1, -1).numpy()
+                mykm = KMeans(n_clusters=min(2 ** self.n_bits, x_np.shape[1]), max_iter=100).fit(x_np.T)
+                for i in range(x_np.shape[1]):
+                    x_np[0, i] = mykm.cluster_centers_[mykm.labels_[i], :]
+                x_b2t = torch.from_numpy(x_np).to(x.device, dtype=x.dtype).view(x.shape)
+                self.c_k.append(x_b2t.unsqueeze(0))
+                centers_dist = mykm.cluster_centers_[:, 0]
+                centers_dist.sort()
+                distances = []
+                for i in range(len(centers_dist[1:])):
+                    distances.append(abs(centers_dist[i] - centers_dist[i-1]))
+                self.dist_dev_list.append(np.std(distances))
+                delta, zero_point = 1, 0
+            else:
+                raise NotImplementedError
 
         return delta, zero_point
 
@@ -387,7 +424,7 @@ class QuantModule(nn.Module):
             bias = self.org_bias
             
         if weight.dtype != input.dtype: weight = weight.to(input.dtype)
-        if bias.dtype != input.dtype: bias = bias.to(input.dtype)
+        if bias is not None and bias.dtype != input.dtype: bias = bias.to(input.dtype)
         
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
         out = self.activation_function(out)
