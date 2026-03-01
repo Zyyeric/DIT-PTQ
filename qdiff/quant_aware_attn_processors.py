@@ -2,6 +2,7 @@
 import torch
 from diffusers.models.attention import Attention
 from typing import Optional
+from diffusers.utils import deprecate
 
 
 # NOTE Updating this to match AttnProcessor2_0 for Diffusers 0.29.2

@@ -449,7 +449,7 @@ class QuantHunyuanBlock(BaseQuantBlock):
             self.skip_linear = tran.skip_linear
             self.skip_norm = tran.skip_norm
             self.split = tran.skip_linear.weight.shape[1] // 2
-            if isinstance(self.skip_linear, QuantModule) or isinstance(self.skip_linear, QuantModuleMultiQ):
+            if isinstance(self.skip_linear, QuantModule) or type(self.skip_linear).__name__ == 'QuantModuleMultiQ':
                 self.skip_q = True
             else:
                 self.skip_q = False
@@ -596,7 +596,7 @@ class QuantDiffRB(BaseQuantBlock):
         # assert any increase over in_channels is due to long-range skip-connect.
         # predefine flags for split here
         self.conv1_q, self.conv_shortcut_q = False, False
-        if isinstance(self.conv1, QuantModule) or isinstance(self.conv1, QuantModuleMultiQ):
+        if isinstance(self.conv1, QuantModule) or type(self.conv1).__name__ == 'QuantModuleMultiQ':
             self.conv1_q = True
             self.conv1_split = self.out_channels if self.in_channels - self.out_channels > 0 else 0
         if self.conv_shortcut is not None and isinstance(self.conv_shortcut, QuantModule):
