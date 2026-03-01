@@ -5,9 +5,6 @@ from torch import nn
 import torch
 from torch.autograd import Function
 
-# Functional
-from utils import MethodMap, ClassEnumOptions
-
 # For FP adaround
 class FloorStraightThrough(Function):
     @staticmethod
@@ -96,56 +93,6 @@ class StackSigmoidFunctional(Function):
         return stacked_sigmoid_grad * grad_output, None
 
 
-# Parametrized modules
-class ParametrizedGradEstimatorBase(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self._trainable = False
-
-    def make_grad_params_trainable(self):
-        self._trainable = True
-        for name, buf in self.named_buffers(recurse=False):
-            setattr(self, name, torch.nn.Parameter(buf))
-
-    def make_grad_params_tensor(self):
-        self._trainable = False
-        for name, param in self.named_parameters(recurse=False):
-            cur_value = param.data
-            delattr(self, name)
-            self.register_buffer(name, cur_value)
-
-    def forward(self, x):
-        raise NotImplementedError()
-
-
-class StackedSigmoid(ParametrizedGradEstimatorBase):
-    """
-    Stacked sigmoid estimator based on a simulated sigmoid forward pass
-    """
-
-    def __init__(self, alpha=1.0):
-        super().__init__()
-        self.register_buffer("alpha", torch.tensor(alpha))
-
-    def forward(self, x):
-        return stacked_sigmoid_func(x, self.alpha)
-
-    def extra_repr(self):
-        return f"alpha={self.alpha.item()}"
-
-
-class EWGSDiscretizer(ParametrizedGradEstimatorBase):
-    def __init__(self, scaling_factor=0.2):
-        super().__init__()
-        self.register_buffer("scaling_factor", torch.tensor(scaling_factor))
-
-    def forward(self, x):
-        return ewgs_func(x, self.scaling_factor)
-
-    def extra_repr(self):
-        return f"scaling_factor={self.scaling_factor.item()}"
-
-
 class StochasticRounding(nn.Module):
     def __init__(self):
         super().__init__()
@@ -163,10 +110,3 @@ scale_grad_func = ScaleGradient.apply
 stochastic_round_ste_func = StochasticRoundSTE.apply
 ewgs_func = EWGSFunctional.apply
 floor_ste_func = FloorStraightThrough.apply
-
-
-class GradientEstimator(ClassEnumOptions):
-    ste = MethodMap(round_ste_func)
-    stoch_round = MethodMap(StochasticRounding)
-    ewgs = MethodMap(EWGSDiscretizer)
-    stacked_sigmoid = MethodMap(StackedSigmoid)
