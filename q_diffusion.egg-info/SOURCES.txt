@@ -43,6 +43,7 @@ qdiff/__init__.py
 qdiff/adaptive_rounding.py
 qdiff/block_recon.py
 qdiff/caption_util.py
+qdiff/gptq.py
 qdiff/layer_recon.py
 qdiff/quant_aware_attn_processors.py
 qdiff/quant_block.py
