@@ -1,23 +1,28 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# submit_int4_gptq.sh  –  Submit PixArt-Alpha INT4 GPTQ Generation Job
+# submit_calib.sh  –  Submit PixArt-Alpha calibration data generation job
 #
 # Usage:
-#   bash submit_int4_gptq.sh                        # run with defaults
-#   OUTDIR=my_custom_dir bash submit_int4_gptq.sh   # override output dir
+#   bash submit_calib.sh                        # run with defaults
+#   COCO_ROOT=/my/coco bash submit_calib.sh     # override COCO path
+#   NUM_IMAGES=256 bash submit_calib.sh         # override image count
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Configurable from outside ─────────────────────────────────────────────────
-OUTDIR="${OUTDIR:-outputs/int4_gptq_run}"
-CALI_DATA="${CALI_DATA:-pixart_calib_brecq.pt}"
+COCO_ROOT="${COCO_ROOT:-/gpfs/projects/e33188/datasets/coco}"
+NUM_IMAGES="${NUM_IMAGES:-128}"
+VAE_BATCH="${VAE_BATCH:-16}"
+TEXT_BATCH="${TEXT_BATCH:-128}"
+DESIRED_STEPS="${DESIRED_STEPS:-20}"
+OUTPUT_FILE="${OUTPUT_FILE:-pixart_calib_brecq.pt}"
 # ─────────────────────────────────────────────────────────────────────────────
 
 sbatch <<EOF
 #!/bin/bash
-#SBATCH --job-name=int4_gptq
-#SBATCH --output=logs/int4_gptq_%j.out
-#SBATCH --error=logs/int4_gptq_%j.err
-#SBATCH --time=12:00:00
+#SBATCH --job-name=pixart_calib
+#SBATCH --output=logs/calib_%j.out
+#SBATCH --error=logs/calib_%j.err
+#SBATCH --time=04:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -33,8 +38,12 @@ echo "Node           : \$SLURMD_NODENAME"
 echo "Started at     : \$(date)"
 echo "=========================================="
 echo "Config:"
-echo "  OUTDIR        = ${OUTDIR}"
-echo "  CALI_DATA     = ${CALI_DATA}"
+echo "  COCO_ROOT     = ${COCO_ROOT}"
+echo "  NUM_IMAGES    = ${NUM_IMAGES}"
+echo "  VAE_BATCH     = ${VAE_BATCH}"
+echo "  TEXT_BATCH    = ${TEXT_BATCH}"
+echo "  DESIRED_STEPS = ${DESIRED_STEPS}"
+echo "  OUTPUT_FILE   = ${OUTPUT_FILE}"
 echo "=========================================="
 
 # ── Cache dirs ────────────────────────────────────────────────────────────────
@@ -43,9 +52,13 @@ export TRANSFORMERS_CACHE=/gpfs/projects/e33188/hf_cache
 export HF_DATASETS_CACHE=/gpfs/projects/e33188/hf_cache
 mkdir -p /gpfs/projects/e33188/hf_cache
 
-# ── Pass tuning knobs through to the script ───────────────────────────────────
-export OUTDIR="${OUTDIR}"
-export CALI_DATA="${CALI_DATA}"
+# ── Pass COCO + tuning knobs through to the script ───────────────────────────
+export COCO_ROOT="${COCO_ROOT}"
+export NUM_IMAGES="${NUM_IMAGES}"
+export VAE_BATCH="${VAE_BATCH}"
+export TEXT_BATCH="${TEXT_BATCH}"
+export DESIRED_STEPS="${DESIRED_STEPS}"
+export OUTPUT_FILE="${OUTPUT_FILE}"
 
 source .env
 
@@ -62,26 +75,8 @@ nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
 echo ""
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-echo "Starting INT4 GPTQ Calibration and Generation..."
-
-python scripts/pixart_alpha_brecq.py \\
-  --cond \\
-  --n_samples 1 \\
-  --res 512 \\
-  --coco_10k \\
-  --outdir "\${OUTDIR}" \\
-  --cali_data_path "\${CALI_DATA}" \\
-  --ptq \\
-  --quant_mode qdiff \\
-  --cali_batch_size 16 \\
-  --weight_bit 4 \\
-  --weight_group_size 128 \\
-  --disable_fp_quant \\
-  --gptq \\
-  --gptq_groupsize 128 \\
-  --gptq_blocksize 128 \\
-  --w_sym \\
-  --w_clip_ratio 1.0
+echo "Starting calibration..."
+python scripts/calib.py
 
 EXIT_CODE=\$?
 
@@ -92,14 +87,18 @@ echo "Finished at : \$(date)"
 echo "Exit code   : \${EXIT_CODE}"
 if [ \${EXIT_CODE} -eq 0 ]; then
     echo "Status      : SUCCESS"
+    if [ -f "${OUTPUT_FILE}" ]; then
+        SIZE=\$(du -sh "${OUTPUT_FILE}" | cut -f1)
+        echo "Output file : ${OUTPUT_FILE} (\${SIZE})"
+    fi
 else
-    echo "Status      : FAILED — check logs/int4_gptq_\${SLURM_JOB_ID}.err"
+    echo "Status      : FAILED — check logs/calib_\${SLURM_JOB_ID}.err"
 fi
 echo "=========================================="
 
 exit \${EXIT_CODE}
 EOF
 
-echo "Submitted INT4 GPTQ job."
-echo "  Logs  →  logs/int4_gptq_<jobid>.out / .err"
+echo "Submitted calibration job."
+echo "  Logs  →  logs/calib_<jobid>.out / .err"
 echo "  Track →  squeue -u \$USER"
