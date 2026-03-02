@@ -1,0 +1,13 @@
+==========================================
+SLURM Job ID   : 586546
+Node           : qgpu2013
+Started at     : Mon Mar  2 08:40:38 CST 2026
+==========================================
+Config:
+  OUTDIR        = outputs/int4_gptq_run
+  CALI_DATA     = pixart_calib_brecq.pt
+==========================================
+GPU info:
+NVIDIA A100-SXM4-80GB, 81920 MiB, 81154 MiB
+
+Starting INT4 GPTQ Calibration and Generation...

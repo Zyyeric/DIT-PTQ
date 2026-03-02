@@ -17,7 +17,7 @@ sbatch <<EOF
 #SBATCH --job-name=int4_gptq
 #SBATCH --output=logs/int4_gptq_%j.out
 #SBATCH --error=logs/int4_gptq_%j.err
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -36,6 +36,10 @@ echo "Config:"
 echo "  OUTDIR        = ${OUTDIR}"
 echo "  CALI_DATA     = ${CALI_DATA}"
 echo "=========================================="
+set -e
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=8
+export HF_HUB_DISABLE_SYMLINKS_WARNING=1
 
 # ── Cache dirs ────────────────────────────────────────────────────────────────
 export HF_HOME=/gpfs/projects/e33188/hf_cache
@@ -81,7 +85,7 @@ python scripts/pixart_alpha_brecq.py \\
   --gptq_groupsize 128 \\
   --gptq_blocksize 128 \\
   --w_sym \\
-  --w_clip_ratio 1.0
+  --w_clip_ratio 1.0 \\
   --gptq_cali_n 256
 EXIT_CODE=\$?
 
