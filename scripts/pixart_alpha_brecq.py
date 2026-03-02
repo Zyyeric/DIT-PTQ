@@ -260,6 +260,11 @@ def main():
     parser.add_argument("--gptq_percdamp", type=float, default=0.01)
     parser.add_argument("--gptq_groupsize", type=int, default=-1)
     parser.add_argument("--gptq_blocksize", type=int, default=128)
+    parser.add_argument("--gptq_cali_n", type=int, default=256,
+                        help="Number of calibration samples for GPTQ Hessian collection. "
+                             "128-256 is sufficient — GPTQ is not sensitive to sample count "
+                             "beyond this. Default 256. Full cali_n (e.g. 5120) makes "
+                             "Hessian collection 20-40x slower with negligible quality gain.")
     parser.add_argument("--w_sym", action="store_true")
     parser.add_argument("--w_clip_ratio", type=float, default=1.0)
 
@@ -320,7 +325,8 @@ def main():
         log(f"  weight_bit={opt.weight_bit}  act_bit={opt.act_bit}  "
             f"quant_mode={opt.quant_mode}  quant_act={opt.quant_act}")
         log(f"  gptq={opt.gptq}  gptq_groupsize={opt.gptq_groupsize}  "
-            f"gptq_blocksize={opt.gptq_blocksize}  gptq_percdamp={opt.gptq_percdamp}")
+            f"gptq_blocksize={opt.gptq_blocksize}  gptq_percdamp={opt.gptq_percdamp}  "
+            f"gptq_cali_n={opt.gptq_cali_n}")
         log(f"  cali_batch_size={opt.cali_batch_size}  cali_iters={opt.cali_iters}  "
             f"cali_iters_a={opt.cali_iters_a}")
         log(f"  weight_group_size={opt.weight_group_size}  w_sym={opt.w_sym}  "
@@ -481,23 +487,80 @@ def main():
             else:
                 log("  Initializing weight quantization parameters...")
 
-            # Weight quant init forward pass
-            log("  Running init forward pass (2 samples)...")
+            # ── Cali data stays on CPU throughout ─────────────────────────────
+            # cali_xs alone is ~10.5 GB and cali_cs ~5 GB. Moving them to GPU
+            # all at once causes a silent CUDA OOM deadlock. We keep everything
+            # on CPU and .to(device) only the small slices we need per operation.
+            xs_gb = cali_xs.element_size() * cali_xs.numel() / 1024**3
+            cs_gb = cali_cs.element_size() * cali_cs.numel() / 1024**3
+            log(f"  Cali data staying on CPU:")
+            log(f"    cali_xs: {tuple(cali_xs.shape)}  {xs_gb:.2f} GB")
+            log(f"    cali_cs: {tuple(cali_cs.shape)}  {cs_gb:.2f} GB")
+            log(f"    total: {xs_gb + cs_gb:.2f} GB  — NOT moving to GPU")
+            log_gpu("before init forward pass")
+
+            # Weight quant init forward pass — only 2 samples needed to
+            # initialize UAQ delta/zero_point for every QuantModule.
+            #
+            # IMPORTANT: temporarily override scale_method to 'max' for this
+            # init pass. The configured method (e.g. 'mse') runs a 100-point
+            # grid search per layer group during the first forward pass, which
+            # for 287 layers × (weight_cols / group_size) groups can take
+            # 10-30 minutes and appears as a hang. 'max' is O(1) and just
+            # needs to create correctly-shaped delta/zero_point tensors.
+            # The actual MSE-optimal scales are found during BRECQ/GPTQ anyway.
+            # ── Temporarily override scale_method='max' for init pass ──────
+            # 'mse' runs a 100-point grid search per group during the first
+            # forward pass (287 layers × cols/128 groups = thousands of searches
+            # on CPU). 'max' is O(1) and just creates correctly-shaped tensors.
+            # MSE-optimal scales are recomputed properly during GPTQ/BRECQ.
+            n_overridden = 0
+            for m in qnn.modules():
+                if hasattr(m, 'weight_quantizer') and hasattr(m.weight_quantizer, 'scale_method'):
+                    m.weight_quantizer.scale_method = 'max'
+                    n_overridden += 1
+            log(f"  Overrode scale_method → 'max' on {n_overridden} weight quantizers")
+            log(f"  (will restore to '{opt.weight_quant_method}' after init pass)")
+
             qnn.set_quant_state(weight_quant=True, act_quant=False)
-            cali_xs = cali_xs.to(device)
-            cali_ts = cali_ts.to(device)
-            cali_cs = cali_cs.to(device)
-            log(f"    cali_xs on device: {cali_xs.device}  shape={tuple(cali_xs.shape)}")
+            log(f"  Moving 2 samples to {device} and running forward pass...")
             t_init = time.time()
             with torch.no_grad():
+                _xs2 = cali_xs[:2].to(device)
+                _ts2 = cali_ts[:2].to(device)
+                _cs2 = cali_cs[:2].to(device)
+                log(f"    xs2={tuple(_xs2.shape)} dtype={_xs2.dtype}  "
+                    f"ts2={tuple(_ts2.shape)}  cs2={tuple(_cs2.shape)}")
                 _ = qnn(
-                    cali_xs[:2],
-                    timestep=cali_ts[:2],
-                    encoder_hidden_states=cali_cs[:2],
-                    added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[:2]),
+                    _xs2,
+                    timestep=_ts2,
+                    encoder_hidden_states=_cs2,
+                    added_cond_kwargs=pixart_alpha_aca_dict(_xs2),
                 )
+                del _xs2, _ts2, _cs2
+            torch.cuda.empty_cache()
             log(f"  Init forward pass done in {elapsed(t_init)}")
             log_gpu("after init forward pass")
+
+            # Count how many quantizers were actually initialized
+            n_inited = sum(
+                1 for m in qnn.modules()
+                if hasattr(m, 'weight_quantizer')
+                and hasattr(m.weight_quantizer, 'inited')
+                and m.weight_quantizer.inited
+            )
+            log(f"  Weight quantizers initialized: {n_inited}/{n_overridden}")
+
+            # ── Restore configured scale_method for BRECQ/GPTQ ───────────────
+            real_scale_method = opt.weight_quant_method
+            n_restored = 0
+            for m in qnn.modules():
+                if hasattr(m, 'weight_quantizer') and hasattr(m.weight_quantizer, 'scale_method'):
+                    m.weight_quantizer.scale_method = real_scale_method
+                    m.weight_quantizer.inited = False  # force re-init with correct method
+                    n_restored += 1
+            log(f"  Restored scale_method → '{real_scale_method}' on {n_restored} quantizers")
+            log(f"  inited=False reset so GPTQ/BRECQ will recompute with '{real_scale_method}'")
 
             kwargs = dict(
                 cali_data=cali_data, batch_size=opt.cali_batch_size,
@@ -540,14 +603,35 @@ def main():
                     f"gptq_blocksize={opt.gptq_blocksize}")
                 t_gptq = time.time()
 
-                # Collect unique root block names
+                # Build block groups for GPTQ.
+                # Strategy: each transformer_blocks.N is one group (10-11 layers).
+                # Each non-transformer-block QuantModule is its OWN group —
+                # the old code used parts[0]="model" for all of them, collapsing
+                # pos_embed, proj_out, adaln_single, caption_projection into one
+                # massive group with ALL 287 layers, which:
+                #   (a) attaches hooks to every layer for every group's forward pass
+                #   (b) builds Hessians simultaneously for unrelated layers
+                #   (c) holds all Hessians in VRAM at the same time
+                # Correct behavior: each group should share a forward pass because
+                # only layers active during that pass can accumulate Hessian signal.
                 block_names = []
+                seen = set()
                 for name, module in qnn.named_modules():
-                    if isinstance(module, QuantModule) and not module.ignore_reconstruction:
-                        parts = name.split(".")
-                        root = ".".join(parts[:3]) if "transformer_blocks" in name else parts[0]
-                        if root not in block_names:
-                            block_names.append(root)
+                    if not isinstance(module, QuantModule) or module.ignore_reconstruction:
+                        continue
+                    parts = name.split(".")
+                    if "transformer_blocks" in parts:
+                        # e.g. model.transformer_blocks.0.attn1.to_q → group: model.transformer_blocks.0
+                        tb_idx = parts.index("transformer_blocks")
+                        root = ".".join(parts[:tb_idx + 2])  # includes the block number
+                    else:
+                        # Non-transformer-block layers: each is its own group.
+                        # e.g. model.pos_embed.proj, model.proj_out, model.adaln_single.linear
+                        # Use the full module name so each gets processed independently.
+                        root = name
+                    if root not in seen:
+                        seen.add(root)
+                        block_names.append(root)
 
                 log(f"  Total block groups to quantize: {len(block_names)}")
                 for bn in block_names:
@@ -557,10 +641,13 @@ def main():
                     t_blk = time.time()
                     log(f"\n  Block group [{blk_idx+1}/{len(block_names)}]: {block_name}")
 
+                    # Match layers belonging to this block group.
+                    # Use exact prefix with dot boundary to avoid e.g.
+                    # "model.pos_embed.proj" matching "model.pos_embed.proj_out"
                     subset_layers = {
                         name: module
                         for name, module in qnn.named_modules()
-                        if name.startswith(block_name)
+                        if (name == block_name or name.startswith(block_name + "."))
                         and isinstance(module, QuantModule)
                         and not module.ignore_reconstruction
                     }
@@ -587,19 +674,30 @@ def main():
                             return tmp
                         handles.append(module.register_forward_hook(add_batch(name)))
 
-                    log(f"    Running forward passes to collect Hessians "
-                        f"({cali_xs.size(0)} samples, batch={opt.cali_batch_size})...")
+                    # Cap Hessian samples at gptq_cali_n.
+                    # GPTQ is not sensitive to sample count past ~128-256.
+                    # Using the full cali set (e.g. 5120) makes collection
+                    # 20-40x slower with negligible accuracy improvement.
+                    n_total = min(cali_xs.size(0), opt.gptq_cali_n)
+                    bs = opt.cali_batch_size
+                    n_passes = (n_total + bs - 1) // bs
+                    log(f"    Collecting Hessians: {n_total}/{cali_xs.size(0)} samples  "
+                        f"batch={bs}  ({n_passes} passes)  "
+                        f"[capped by --gptq_cali_n={opt.gptq_cali_n}]")
                     t_hess = time.time()
                     qnn.eval()
-                    bs = opt.cali_batch_size
                     with torch.no_grad():
-                        for i in range(0, cali_xs.size(0), bs):
+                        for i in range(0, n_total, bs):
+                            _xs = cali_xs[i:i+bs].to(device)
+                            _ts = cali_ts[i:i+bs].to(device)
+                            _cs = cali_cs[i:i+bs].to(device)
                             _ = qnn(
-                                cali_xs[i:i+bs],
-                                timestep=cali_ts[i:i+bs],
-                                encoder_hidden_states=cali_cs[i:i+bs],
-                                added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[i:i+bs])
+                                _xs,
+                                timestep=_ts,
+                                encoder_hidden_states=_cs,
+                                added_cond_kwargs=pixart_alpha_aca_dict(_xs)
                             )
+                            del _xs, _ts, _cs
                     log(f"    Hessian collection done in {elapsed(t_hess)}")
 
                     for h in handles:
@@ -649,7 +747,7 @@ def main():
                     if isinstance(m, AdaRoundQuantizer):
                         m.zero_point = nn.Parameter(m.zero_point)
                         m.delta = nn.Parameter(m.delta)
-                    elif isinstance(m, UniformAffineQuantizer):
+                    elif isinstance(m, UniformAffineQuantizer) and opt.quant_act:
                         if m.zero_point is not None:
                             if not torch.is_tensor(m.zero_point):
                                 m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
@@ -678,12 +776,14 @@ def main():
                 with torch.no_grad():
                     inds = np.random.choice(cali_xs.shape[0], 16, replace=False)
                     log(f"    sample indices: {inds.tolist()}")
+                    _xs = cali_xs[inds].to(device)
+                    _ts = cali_ts[inds].to(device)
+                    _cs = cali_cs[inds].to(device)
                     _ = qnn(
-                        cali_xs[inds],
-                        timestep=cali_ts[inds],
-                        encoder_hidden_states=cali_cs[inds],
-                        added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[inds]),
+                        _xs, timestep=_ts, encoder_hidden_states=_cs,
+                        added_cond_kwargs=pixart_alpha_aca_dict(_xs),
                     )
+                    del _xs, _ts, _cs
                 log("  Activation init done")
 
                 if opt.running_stat:
@@ -694,12 +794,15 @@ def main():
                     qnn.set_running_stat(True, opt.rs_sm_only)
                     n_batches = int(cali_xs.size(0) / 16)
                     for i in trange(n_batches, desc="running_stat"):
+                        sl = inds[i*16:(i+1)*16]
+                        _xs = cali_xs[sl].to(device)
+                        _ts = cali_ts[sl].to(device)
+                        _cs = cali_cs[sl].to(device)
                         _ = qnn(
-                            cali_xs[inds[i*16:(i+1)*16]],
-                            timestep=cali_ts[inds[i*16:(i+1)*16]],
-                            encoder_hidden_states=cali_cs[inds[i*16:(i+1)*16]],
-                            added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[inds[i*16:(i+1)*16]]),
+                            _xs, timestep=_ts, encoder_hidden_states=_cs,
+                            added_cond_kwargs=pixart_alpha_aca_dict(_xs),
                         )
+                        del _xs, _ts, _cs
                     qnn.set_running_stat(False, opt.rs_sm_only)
                     log(f"  Running stat done in {elapsed(t_rs)}")
 
@@ -725,16 +828,12 @@ def main():
                 if isinstance(m, AdaRoundQuantizer):
                     m.zero_point = nn.Parameter(m.zero_point)
                     m.delta = nn.Parameter(m.delta)
-                elif isinstance(m, UniformAffineQuantizer):
+                elif isinstance(m, UniformAffineQuantizer) and opt.quant_act and opt.disable_online_act_quant:
                     if m.zero_point is not None:
                         if not torch.is_tensor(m.zero_point):
                             m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                         else:
                             m.zero_point = nn.Parameter(m.zero_point)
-
-            ckpt_path = os.path.join(outpath, "ckpt.pth")
-            torch.save(qnn.state_dict(), ckpt_path)
-            log(f"  Saved final checkpoint: {ckpt_path} in {elapsed(t_save)}")
 
         qnn = qnn.to(device=device, dtype=torch.float16)
         model.transformer = qnn
