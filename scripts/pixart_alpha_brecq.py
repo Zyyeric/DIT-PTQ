@@ -649,7 +649,7 @@ def main():
                     if isinstance(m, AdaRoundQuantizer):
                         m.zero_point = nn.Parameter(m.zero_point)
                         m.delta = nn.Parameter(m.delta)
-                    elif isinstance(m, UniformAffineQuantizer) and enable_act_quant:
+                    elif isinstance(m, UniformAffineQuantizer):
                         if m.zero_point is not None:
                             if not torch.is_tensor(m.zero_point):
                                 m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
@@ -725,12 +725,16 @@ def main():
                 if isinstance(m, AdaRoundQuantizer):
                     m.zero_point = nn.Parameter(m.zero_point)
                     m.delta = nn.Parameter(m.delta)
-                elif isinstance(m, UniformAffineQuantizer) and enable_act_quant and opt.disable_online_act_quant:
+                elif isinstance(m, UniformAffineQuantizer):
                     if m.zero_point is not None:
                         if not torch.is_tensor(m.zero_point):
                             m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                         else:
                             m.zero_point = nn.Parameter(m.zero_point)
+
+            ckpt_path = os.path.join(outpath, "ckpt.pth")
+            torch.save(qnn.state_dict(), ckpt_path)
+            log(f"  Saved final checkpoint: {ckpt_path} in {elapsed(t_save)}")
 
         qnn = qnn.to(device=device, dtype=torch.float16)
         model.transformer = qnn
