@@ -607,6 +607,13 @@ def main():
                     log(f"    Collecting Hessians: {n_total}/{cali_xs.size(0)} samples  "
                         f"batch={bs}  ({n_passes} passes)  "
                         f"[capped by --gptq_cali_n={opt.gptq_cali_n}]")
+                    # CRITICAL: disable weight quantization during Hessian
+                    # collection. GPTQ only needs the input activations — the
+                    # hooks capture inp before any weight interaction. Running
+                    # with weight_quant=True and group_quant=True makes every
+                    # forward pass ~270x slower (543s for 2 samples vs ~2s fp16).
+                    # With weight_quant=False, 16 passes × ~2s = ~32s total.
+                    qnn.set_quant_state(weight_quant=False, act_quant=False)
                     t_hess = time.time()
                     qnn.eval()
                     with torch.no_grad():
@@ -621,6 +628,8 @@ def main():
                                 added_cond_kwargs=pixart_alpha_aca_dict(_xs)
                             )
                             del _xs, _ts, _cs
+                    # Restore weight quant state for fasterquant
+                    qnn.set_quant_state(weight_quant=True, act_quant=False)
                     log(f"    Hessian collection done in {elapsed(t_hess)}")
 
                     for h in handles:
