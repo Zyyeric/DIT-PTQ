@@ -1,186 +1,308 @@
 from diffusers import PixArtAlphaPipeline
-#from sdxl_wrapper import StableDiffusionXLPipeline, 
 import torch
-from PIL import Image
 import os
+import time
+import datetime
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from torchvision.datasets import CocoDetection
-from qdiff import QuantModel
-import sys
-from copy import deepcopy
 from pytorch_lightning import seed_everything
 
-from qdiff import QuantModel
-
-# TODO pull actual images, and prompts, from COCO.
-# TODO change location
-image_sample = "/home/ruichen/data/coco/val2017/000000462614.jpg"
-
-timesteps = list(reversed(range(50)))
-
-#quant_params = [int(sys.argv[1]), int(sys.argv[2])]
-#print(quant_params)
 seed_everything(42)
 
+# ── tuneable knobs (override via env vars or edit directly) ──────────────────
+NUM_IMAGES    = int(os.environ.get("NUM_IMAGES",    128))
+VAE_BATCH     = int(os.environ.get("VAE_BATCH",      16))  # increase if VRAM allows
+TEXT_BATCH    = int(os.environ.get("TEXT_BATCH",    128))  # lower if OOM
+DESIRED_STEPS = int(os.environ.get("DESIRED_STEPS",  20))
+OUTPUT_FILE   = os.environ.get("OUTPUT_FILE", "pixart_calib_brecq.pt")
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── logging helpers ───────────────────────────────────────────────────────────
+def now():
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+def log(msg):
+    print(f"[{now()}] {msg}", flush=True)
+
+def log_gpu():
+    if torch.cuda.is_available():
+        alloc  = torch.cuda.memory_allocated()  / 1024**3
+        reserv = torch.cuda.memory_reserved()   / 1024**3
+        total  = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        log(f"  GPU memory  →  allocated: {alloc:.2f} GB  |  reserved: {reserv:.2f} GB  |  total: {total:.2f} GB")
+    else:
+        log("  GPU memory  →  running on CPU, no VRAM stats")
+
+def tensor_stats(t, name):
+    log(f"  {name}: shape={tuple(t.shape)}  dtype={t.dtype}  "
+        f"min={t.float().min():.4f}  max={t.float().max():.4f}  "
+        f"mean={t.float().mean():.4f}  std={t.float().std():.4f}")
+
+def elapsed(start):
+    return f"{time.time() - start:.1f}s"
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCRIPT_START = time.time()
+
 if __name__ == "__main__":
+
+    log("=" * 70)
+    log("PixArt-Alpha Calibration Data Generator")
+    log("=" * 70)
+    log(f"Config  →  NUM_IMAGES={NUM_IMAGES}  VAE_BATCH={VAE_BATCH}  "
+        f"TEXT_BATCH={TEXT_BATCH}  DESIRED_STEPS={DESIRED_STEPS}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
-    pipeline = PixArtAlphaPipeline.from_pretrained("PixArt-alpha/PixArt-XL-2-512x512", torch_dtype=dtype)
+    dtype  = torch.float16 if device.type == "cuda" else torch.float32
+    log(f"Device  →  {device}  |  dtype={dtype}")
+    if torch.cuda.is_available():
+        log(f"GPU     →  {torch.cuda.get_device_name(0)}")
+    log_gpu()
+
+    # ── 1. Load pipeline ──────────────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log("STEP 1/5  Loading PixArt-Alpha pipeline...")
+    t0 = time.time()
+
+    pipeline = PixArtAlphaPipeline.from_pretrained(
+        "PixArt-alpha/PixArt-XL-2-512x512", torch_dtype=dtype
+    )
     if device.type == "cuda":
         try:
             pipeline.enable_model_cpu_offload()
-        except Exception:
+            log("  CPU offload enabled (model moves to GPU on demand)")
+        except Exception as e:
+            log(f"  CPU offload failed ({e}), moving full pipeline to GPU")
             pipeline = pipeline.to(device)
     else:
         pipeline = pipeline.to(device)
-    #pipeline.upcast_vae() # NOTE: This was necessary for SDXL
-    #pipeline = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16, use_safetensors=True, variant="fp16").to("cuda")
-    vae = pipeline.vae
+
+    vae             = pipeline.vae
     noise_scheduler = pipeline.scheduler
-    mse = torch.nn.MSELoss()
+    log(f"  Pipeline loaded in {elapsed(t0)}")
+    log(f"  Scheduler  →  {noise_scheduler.__class__.__name__}")
+    log(f"  VAE config →  scaling_factor={vae.config.scaling_factor}")
+    log(f"  Scheduler num_train_timesteps  →  {noise_scheduler.config.num_train_timesteps}")
+    log_gpu()
 
-    #wq_params = {'n_bits': quant_params[0], 'channel_wise': True, 'scale_method': 'max'}
-    #aq_params = {'n_bits': quant_params[1], 'channel_wise': False, 'scale_method': 'max', 'leaf_param':  True if quant_params[1] < 10 else False}
+    # ── 2. COCO dataset ───────────────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log("STEP 2/5  Setting up COCO dataset...")
+    t0 = time.time()
 
-    # TODO code for quantizing U-Net for certain steps.
-    #transformer = qnn # pipeline.transformer
+    coco_transform = transforms.Compose([
+        transforms.Resize(512, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(512),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),
+    ])
 
-    # Preprocessing the datasets.
-    coco_transform = transforms.Compose(
-        [
-            transforms.Resize(512, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(512) if False else transforms.RandomCrop(512),
-            transforms.RandomHorizontalFlip() if False else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-
-    # NOTE: Default to ~/datasets/coco; override with COCO_ROOT if needed.
     coco_root = os.path.expanduser(os.environ.get("COCO_ROOT", "~/datasets/coco"))
+    log(f"  COCO root  →  {coco_root}")
+
     coco_ds = CocoDetection(
         root=os.path.join(coco_root, "train2017"),
         annFile=os.path.join(coco_root, "annotations", "captions_train2017.json"),
         transform=coco_transform,
     )
+    log(f"  Full dataset size  →  {len(coco_ds)} images")
+    coco_ds.ids = coco_ds.ids[-NUM_IMAGES:]
+    log(f"  Using last {NUM_IMAGES} images  →  IDs [{coco_ds.ids[0]} … {coco_ds.ids[-1]}]")
 
-    num_images, batch_size = 128, 1
-    coco_ds.ids = coco_ds.ids[-num_images:] # To ensure some difference...
+    coco_dl = DataLoader(
+        coco_ds,
+        batch_size=VAE_BATCH,
+        shuffle=False,
+        collate_fn=lambda x: x,
+        num_workers=4,
+        pin_memory=True,
+    )
+    log(f"  DataLoader  →  {len(coco_dl)} batches of {VAE_BATCH}")
+    log(f"  Dataset ready in {elapsed(t0)}")
 
-    coco_dl = DataLoader(coco_ds, batch_size=batch_size, shuffle=False, collate_fn=lambda x: x)
+    # Set scheduler timesteps NOW and log the real values
+    # This maps DESIRED_STEPS indices → actual diffusion timesteps (e.g. 999, 949, ..., 0)
+    noise_scheduler.set_timesteps(DESIRED_STEPS)
+    real_timesteps = noise_scheduler.timesteps  # shape: [DESIRED_STEPS], values e.g. [999, 949, ...]
+    log(f"  Scheduler real timesteps  →  {real_timesteps.tolist()}")
 
-    # NOTE controls timesteps
-    desired_timesteps = 20
-    timestep_list = list(range(desired_timesteps))
-    timestep_list.reverse()
+    # ── 3. VAE encode all images ──────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log(f"STEP 3/5  VAE-encoding {NUM_IMAGES} images (batch={VAE_BATCH})...")
+    t0 = time.time()
 
-    xs, time_calib, all_pe, all_ppe, all_tids = torch.randn(desired_timesteps, num_images, 4, 64, 64), torch.zeros(desired_timesteps, num_images).long(), [], torch.randn(num_images, 1280), torch.randn(1, 6)
-    all_uncond_pe = []
-    assert(all_uncond_pe == all_pe)
+    latents_list    = []
+    all_prompts_raw = []
+
     with torch.no_grad():
+        for batch_idx, img_info in enumerate(coco_dl):
+            tb = time.time()
+            images = torch.cat([img[0].unsqueeze(0) for img in img_info], dim=0)
+            log(f"  Batch {batch_idx+1}/{len(coco_dl)}  "
+                f"image tensor shape={tuple(images.shape)}  dtype={images.dtype}")
 
-        latents_list = []
-        for img_info in coco_dl:
-            image_sample = torch.cat([img[0].unsqueeze(0) for img in img_info], axis=0)
-            latents_list.append(
-                vae.encode(image_sample.to(device, dtype=dtype)).latent_dist.sample().to(dtype) * vae.config.scaling_factor
+            lat = (
+                vae.encode(images.to(device, dtype=dtype))
+                   .latent_dist.sample()
+                   .to(dtype)
+                * vae.config.scaling_factor
             )
-        latents = torch.cat(latents_list, dim=0)
-        #print(latents)
-        noise = torch.randn_like(latents)
-        #print(noise.shape)
+            latents_list.append(lat.cpu())
 
-        for ts in timestep_list:
-            loss = 0
-            #qnn = QuantModel(deepcopy(pipeline.transformer), weight_quant_params=wq_params, act_quant_params=aq_params, act_quant_mode="qdiff", sm_abit=16)
-            #qnn.cuda()
-            #qnn.eval()
-            #qnn.set_quant_state(weight_quant=True if quant_params[0] < 10 else False,
-            #            act_quant=True if quant_params[1] < 10 else False)
-            #transformer = qnn
-            pe_list = []
-            uncond_pe_list = []
-            for i, img_info in enumerate(coco_dl):
-                #print("======")
-                image_sample = torch.cat([img[0].unsqueeze(0) for img in img_info], axis=0)
-                prompt_list = [p[1][0]['caption'] for p in img_info]
+            prompts = [p[1][0]['caption'] for p in img_info]
+            all_prompts_raw.extend(prompts)
 
-                timesteps = torch.Tensor([ts] * len(prompt_list)) #.long()
-                timesteps = timesteps.to(device)
+            log(f"    latent batch shape={tuple(lat.shape)}  "
+                f"min={lat.float().min():.3f}  max={lat.float().max():.3f}  "
+                f"({elapsed(tb)})")
+            log(f"    sample prompts: {prompts[:2]}")
 
-                # TODO the text here is slightly different for SDXL
-                #print(latents)
-                noisy_latents = noise_scheduler.add_noise(latents[i*batch_size:(i+1)*batch_size, :, :, :], 
-                                                          noise[i*batch_size:(i+1)*batch_size, :, :, :],
-                                                          timesteps)
-                noisy_latents = noise_scheduler.scale_model_input(noisy_latents, ts)
-                
-                #noisy_latents = pipeline.scheduler.step(noise[i*batch_size:(i+1)#*batch_size, :, :, :], timesteps, latents[i*batch_size:(i+1)#*batch_size, :, :, :], return_dict=False)[0]
+    latents = torch.cat(latents_list, dim=0)
+    noise   = torch.randn_like(latents)
 
-                # TODO actual COCO prompt
-                prompt_embeds, _, negative_prompt_embeds, _ = pipeline.encode_prompt(prompt_list) #,
-                                                                #torch.device('cuda:0'),
-                                                                #num_images_per_prompt=1,
-                                                                #do_classifier_free_guidance=False) #[0]
-                #encoder_hidden_states = encoder_hidden_states[:len(prompt_list), :, :]
-                #prompt_tokens = pipeline.tokenizer(prompt_list)
-                #encoder_hidden_states = pipeline.text_encoder(prompt_tokens, return_dict=False)[0]
-                #print("EHS:", encoder_hidden_states.shape)
-                #print(negative_prompt_embeds.shape)
-                #print(prompt_embeds.shape)
-                print(prompt_list)
-                #assert(negative_prompt_embeds.shape != prompt_embeds.shape)
+    log(f"  All images encoded in {elapsed(t0)}")
+    tensor_stats(latents, "latents (all)")
+    tensor_stats(noise,   "noise   (all)")
+    log(f"  Total prompts collected: {len(all_prompts_raw)}")
+    log_gpu()
 
-                #height = pipeline.default_sample_size * pipeline.vae_scale_factor
-                #width = pipeline.default_sample_size * pipeline.vae_scale_factor
+    # ── 4. Text embedding ─────────────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log(f"STEP 4/5  T5-XXL encoding {NUM_IMAGES} prompts (batch={TEXT_BATCH})...")
+    t0 = time.time()
 
-                #original_size = (height, width)
-                #target_size = (height, width)
+    pe_chunks, upe_chunks = [], []
+    num_text_batches = (NUM_IMAGES + TEXT_BATCH - 1) // TEXT_BATCH
 
-                #add_time_ids = pipeline._get_add_time_ids(
-                #    original_size, (0, 0), target_size, dtype=prompt_embeds.dtype
-                #)
-                #add_time_ids = add_time_ids.to("cuda").repeat(batch_size * 1, 1)
-                #added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}  # SDXL
-                added_cond_kwargs = {'resolution': None, 'aspect_ratio': None}  # PixArt
-                #print(pooled_prompt_embeds.shape)
-                #print(add_time_ids.shape)
-                #print(noisy_latents.shape)
-                #print(timesteps.shape)
-                #print(prompt_embeds.shape)
-                #model_pred = pipeline.transformer(hidden_states=noisy_latents, timestep=timesteps, encoder_hidden_states=prompt_embeds, added_cond_kwargs=added_cond_kwargs, #cross_attention_kwargs={},
-                                #return_dict=False
-                #                )[0]
-                # NOTE: 8, 64, 64 -> First 4 channels is for CS, last 4 are for UCS.
-                # NOTE: What this means is that the tuples are not (xs, ts, cs), (xs, ts, ucs), but (xs, ts, cs, ucs)
-                #print(model_pred.shape)
-                
-                #added_cond_kwargs['text_embeds'] = added_cond_kwargs['text_embeds'].detach().cpu()
-                #added_cond_kwargs['time_ids'] = added_cond_kwargs['time_ids'].detach().cpu()
-                #aka.append(added_cond_kwargs)
-                pe_list.append(prompt_embeds.detach().cpu())
-                uncond_pe_list.append(negative_prompt_embeds.detach().cpu())
-                time_calib[ts, i] = ts
-                xs[ts, i, :, :, :] = noisy_latents.detach().cpu() #model_pred.detach().cpu()
-                #all_ppe[i, :] = added_cond_kwargs['text_embeds']
-                
-            #del transformer
-            #del qnn
-            torch.cuda.empty_cache()
-            all_pe.append(torch.cat(pe_list, dim=0))
-            all_uncond_pe.append(torch.cat(uncond_pe_list, dim=0))
-        all_pe = torch.cat([x.unsqueeze(0) for x in all_pe], dim=0)
-        all_uncond_pe = torch.cat([x.unsqueeze(0) for x in all_uncond_pe], dim=0)
-        #all_tids = added_cond_kwargs['time_ids']
-        # NOTE Need to add UCS support
+    with torch.no_grad():
+        for b_idx, start in enumerate(range(0, NUM_IMAGES, TEXT_BATCH)):
+            tb  = time.time()
+            end = min(start + TEXT_BATCH, NUM_IMAGES)
+            batch_prompts = all_prompts_raw[start:end]
+            log(f"  Text batch {b_idx+1}/{num_text_batches}  "
+                f"prompts [{start}:{end}]  (count={len(batch_prompts)})")
 
-        print(all_pe.shape)
-        print(all_uncond_pe.shape)
-        assert(all_uncond_pe.shape == all_pe.shape)
+            pe, _, upe, _ = pipeline.encode_prompt(batch_prompts)
+            pe_chunks.append(pe.cpu())
+            upe_chunks.append(upe.cpu())
 
-        assert(torch.equal(all_uncond_pe[0][0], all_uncond_pe[0][1])) # prompt("") should remain unchange across different image
-        assert(not torch.equal(all_pe[0][0], all_pe[0][1])) # prompt(different prompt) should be different across different image
+            log(f"    cond embed shape={tuple(pe.shape)}  "
+                f"uncond embed shape={tuple(upe.shape)}  ({elapsed(tb)})")
+            log(f"    cond   stats → min={pe.float().min():.4f}  "
+                f"max={pe.float().max():.4f}  mean={pe.float().mean():.4f}")
+            log(f"    uncond stats → min={upe.float().min():.4f}  "
+                f"max={upe.float().max():.4f}  mean={upe.float().mean():.4f}")
+            log_gpu()
 
-        torch.save({'xs': xs, 'ts': time_calib, 'cs': all_pe, 'ucs': all_uncond_pe}, #, 'text_embeds': all_ppe, 'time_ids': all_tids},
-                    "pixart_calib_brecq.pt")
+    cached_pe     = torch.cat(pe_chunks,  dim=0)
+    cached_uncond = torch.cat(upe_chunks, dim=0)
+
+    log(f"  All prompts encoded in {elapsed(t0)}")
+    tensor_stats(cached_pe,     "cached_pe    ")
+    tensor_stats(cached_uncond, "cached_uncond")
+
+    # ── 5. Noisy latents across timesteps ─────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log(f"STEP 5/5  Building noisy latents for {DESIRED_STEPS} timesteps "
+        f"(vectorized over {NUM_IMAGES} images)...")
+    log(f"  NOTE: using real scheduler timesteps, std should decrease from ~1.0 → ~{latents.std():.3f}")
+    t0 = time.time()
+
+    xs         = torch.empty(DESIRED_STEPS, NUM_IMAGES, *latents.shape[1:])
+    time_calib = torch.zeros(DESIRED_STEPS, NUM_IMAGES, dtype=torch.long)
+    log(f"  Allocated xs tensor: shape={tuple(xs.shape)}  "
+        f"size={xs.numel()*xs.element_size()/1024**2:.1f} MB")
+
+    with torch.no_grad():
+        lat_gpu   = latents.to(device, dtype=dtype)
+        noise_gpu = noise.to(device, dtype=dtype)
+        log(f"  Moved latents + noise to {device}")
+        log_gpu()
+
+        for i, actual_ts in enumerate(real_timesteps):
+            tb    = time.time()
+            # actual_ts is the real diffusion timestep (e.g. 999, 949, ..., 0)
+            t_vec = torch.full((NUM_IMAGES,), actual_ts.item(), dtype=torch.long, device=device)
+            noisy = noise_scheduler.add_noise(lat_gpu, noise_gpu, t_vec)
+            noisy = noise_scheduler.scale_model_input(noisy, actual_ts)
+
+            xs[i]         = noisy.cpu()
+            time_calib[i] = actual_ts.item()  # store real timestep value, not index
+
+            log(f"  idx={i:2d}  actual_ts={actual_ts.item():4d}  [{i+1:2d}/{DESIRED_STEPS}]  "
+                f"noisy shape={tuple(noisy.shape)}  "
+                f"min={noisy.float().min():.3f}  max={noisy.float().max():.3f}  "
+                f"std={noisy.float().std():.3f}  ({elapsed(tb)})")
+
+    log(f"  All timesteps done in {elapsed(t0)}")
+    log(f"  Sanity: xs[0] (ts={time_calib[0,0].item()}) std={xs[0].float().std():.3f}  ← should be ~1.0 (pure noise)")
+    log(f"  Sanity: xs[-1] (ts={time_calib[-1,0].item()}) std={xs[-1].float().std():.3f}  ← should be ~{latents.std():.3f} (clean latent)")
+    log_gpu()
+
+    # ── 6. Expand embeddings ──────────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log("Expanding embeddings to [T, N, seq, dim]...")
+    all_pe     = cached_pe.unsqueeze(0).expand(DESIRED_STEPS, -1, -1, -1).clone()
+    all_uncond = cached_uncond.unsqueeze(0).expand(DESIRED_STEPS, -1, -1, -1).clone()
+    log(f"  all_pe     shape={tuple(all_pe.shape)}  "
+        f"size={all_pe.numel()*all_pe.element_size()/1024**2:.1f} MB")
+    log(f"  all_uncond shape={tuple(all_uncond.shape)}  "
+        f"size={all_uncond.numel()*all_uncond.element_size()/1024**2:.1f} MB")
+
+    # ── 7. Sanity checks ──────────────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log("Sanity checks...")
+
+    assert all_uncond.shape == all_pe.shape, \
+        f"Shape mismatch: all_pe={all_pe.shape} vs all_uncond={all_uncond.shape}"
+    log("  ✓  all_pe and all_uncond shapes match")
+
+    assert torch.equal(all_uncond[0][0], all_uncond[0][1]), \
+        "Uncond embeddings should be identical across images (empty prompt)"
+    log("  ✓  Uncond embeddings are identical across images (expected for empty prompt)")
+
+    assert not torch.equal(all_pe[0][0], all_pe[0][1]), \
+        "Cond embeddings should differ across images"
+    log("  ✓  Cond embeddings differ across images (different captions)")
+
+    # Verify std decreases monotonically from high → low timestep
+    stds = [xs[i].float().std().item() for i in range(DESIRED_STEPS)]
+    log(f"  Noisy latent std across timesteps (should decrease): "
+        f"{[f'{s:.3f}' for s in stds]}")
+    assert stds[0] > stds[-1], \
+        f"std should decrease from ts[0]={stds[0]:.3f} to ts[-1]={stds[-1]:.3f}"
+    log("  ✓  std decreases from high timestep → low timestep (correct noise schedule)")
+
+    log(f"  xs         shape={tuple(xs.shape)}")
+    log(f"  time_calib shape={tuple(time_calib.shape)}  "
+        f"unique ts={time_calib[:,0].unique().tolist()}")
+    log(f"  all_pe     shape={tuple(all_pe.shape)}")
+    log(f"  all_uncond shape={tuple(all_uncond.shape)}")
+
+    # ── 8. Save ───────────────────────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    out_path = OUTPUT_FILE
+    log(f"Saving checkpoint to {out_path}...")
+    t0 = time.time()
+
+    payload = {'xs': xs, 'ts': time_calib, 'cs': all_pe, 'ucs': all_uncond}
+    total_mb = sum(v.numel() * v.element_size() for v in payload.values()) / 1024**2
+    log(f"  Total tensor data to save: {total_mb:.1f} MB")
+    torch.save(payload, out_path)
+
+    file_mb = os.path.getsize(out_path) / 1024**2
+    log(f"  Saved in {elapsed(t0)}  |  file size on disk: {file_mb:.1f} MB")
+
+    log("")
+    log("=" * 70)
+    log(f"ALL DONE  —  total wall time: {elapsed(SCRIPT_START)}")
+    log("=" * 70)

@@ -1,693 +1,378 @@
-import logging
-from typing import Union
-import numpy as np
-import tqdm
-from tqdm import trange
-import random
+#!/usr/bin/env python
+# Copyright (c) 2021 Qualcomm Technologies, Inc.
+# All Rights Reserved.
 
+import collections
+import os
+import random
+from collections import namedtuple
+from enum import Flag, auto
+from functools import partial
+
+import click
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
-from qdiff.quant_layer import QuantModule, UniformAffineQuantizer
-from qdiff.quant_block import BaseQuantBlock, QuantDiffBTB, QuantDiffRB
-from qdiff.quant_model import QuantModel
-from qdiff.adaptive_rounding import AdaRoundQuantizer
-from qdiff.quant_layer import UniformAffineQuantizer
-
-logger = logging.getLogger(__name__)
 
 
-def is_dist_initialized() -> bool:
-    return dist.is_available() and dist.is_initialized()
-
-
-def get_dist_rank() -> int:
-    if not is_dist_initialized():
-        return 0
-    return dist.get_rank()
-
-
-def get_dist_world_size() -> int:
-    if not is_dist_initialized():
-        return 1
-    return dist.get_world_size()
-
-
-def sync_grads(opt_params):
-    if not is_dist_initialized():
-        return
-    world_size = get_dist_world_size()
-    for p in opt_params:
-        if p.grad is None:
-            continue
-        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        p.grad.div_(world_size)
-
-
-def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBlock], cali_data: torch.Tensor,
-                      asym: bool = False, act_quant: bool = False, weight_quant: bool = True,
-                      batch_size: int = 32, keep_gpu: bool = True,
-                      cond: bool = False, is_sm: bool = False):
+class DotDict(dict):
     """
-    Save input data and output data of a particular layer/block over calibration dataset.
-
-    :param model: QuantModel
-    :param layer: QuantModule or QuantBlock
-    :param cali_data: calibration data set
-    :param asym: if Ture, save quantized input and full precision output
-    :param act_quant: use activation quantization
-    :param batch_size: mini-batch size for calibration
-    :param keep_gpu: put saved data on GPU for faster optimization
-    :param cond: conditional generation or not
-    :param is_sm: avoid OOM when caching n^2 attention matrix when n is large
-    :return: input and output data
+    A dictionary that allows attribute-style access.
+    Examples
+    --------
+    >>> config = DotDict(a=None)
+    >>> config.a = 42
+    >>> config.b = 'egg'
+    >>> config  # can be used as dict
+    {'a': 42, 'b': 'egg'}
     """
-    device = next(model.parameters()).device
-    get_inp_out = GetLayerInpOut(
-        model, layer, device=device, asym=asym, act_quant=act_quant, weight_quant=weight_quant
-    )
-    cached_batches = []
-    cached_inps, cached_outs = None, None
-    torch.cuda.empty_cache()
 
-    if not cond:
-        cali_xs, cali_ts = cali_data
-    elif len(cali_data) == 4:
-        cali_xs, cali_ts, cali_conds, cali_ack = cali_data
+    def __setattr__(self, key, value):
+        self.__setitem__(key, value)
+
+    def __delattr__(self, key):
+        self.__delitem__(key)
+
+    def __getattr__(self, key):
+        if key in self:
+            return self.__getitem__(key)
+        raise AttributeError(f"DotDict instance has no key '{key}' ({self.keys()})")
+
+
+def relu(x):
+    x = np.array(x)
+    return x * (x > 0)
+
+
+def get_all_layer_names(model, subtypes=None):
+    if subtypes is None:
+        return [name for name, module in model.named_modules()][1:]
+    return [name for name, module in model.named_modules() if isinstance(module, subtypes)]
+
+
+def get_layer_name_to_module_dict(model):
+    return {name: module for name, module in model.named_modules() if name}
+
+
+def get_module_to_layer_name_dict(model):
+    modules_to_names = collections.OrderedDict()
+    for name, module in model.named_modules():
+        modules_to_names[module] = name
+    return modules_to_names
+
+
+def get_layer_name(model, layer):
+    for name, module in model.named_modules():
+        if module == layer:
+            return name
+    return None
+
+
+def get_layer_by_name(model, layer_name):
+    for name, module in model.named_modules():
+        if name == layer_name:
+            return module
+    return None
+
+
+def create_conv_layer_list(cls, model: nn.Module) -> list:
+    """
+    Function finds all prunable layers in the provided model
+
+    Parameters
+    ----------
+    cls: SVD class
+    model : torch.nn.Module
+    A pytorch model.
+
+    Returns
+    -------
+    conv_layer_list : list
+    List of all prunable layers in the given model.
+
+    """
+    conv_layer_list = []
+
+    def fill_list(mod):
+        if isinstance(mod, tuple(cls.supported_layer_types)):
+            conv_layer_list.append(mod)
+
+    model.apply(fill_list)
+    return conv_layer_list
+
+
+def create_linear_layer_list(cls, model: nn.Module) -> list:
+    """
+    Function finds all prunable layers in the provided model
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        A pytorch model.
+
+    Returns
+    -------
+    conv_layer_list : list
+        List of all prunable layers in the given model.
+
+    """
+    conv_layer_list = []
+
+    def fill_list(mod):
+        if isinstance(mod, tuple(cls.supported_layer_types)):
+            conv_layer_list.append(mod)
+
+    model.apply(fill_list)
+    return conv_layer_list
+
+
+def to_numpy(tensor):
+    """
+    Helper function that turns the given tensor into a numpy array
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+
+    Returns
+    -------
+    tensor : float or np.array
+
+    """
+    if isinstance(tensor, np.ndarray):
+        return tensor
+    if hasattr(tensor, "is_cuda"):
+        if tensor.is_cuda:
+            return tensor.cpu().detach().numpy()
+    if hasattr(tensor, "detach"):
+        return tensor.detach().numpy()
+    if hasattr(tensor, "numpy"):
+        return tensor.numpy()
+
+    return np.array(tensor)
+
+
+def set_module_attr(model, layer_name, value):
+    split = layer_name.split(".")
+
+    this_module = model
+    for mod_name in split[:-1]:
+        if mod_name.isdigit():
+            this_module = this_module[int(mod_name)]
+        else:
+            this_module = getattr(this_module, mod_name)
+
+    last_mod_name = split[-1]
+    if last_mod_name.isdigit():
+        this_module[int(last_mod_name)] = value
     else:
-        cali_xs, cali_ts, cali_conds = cali_data
-
-    if is_sm:
-        logger.info("Checking if attention is too large...")
-        """
-        if not cond:
-            test_inp, test_out = get_inp_out(
-                cali_xs[:1].to(device), 
-                cali_ts[:1].to(device)
-            )
-        else:
-            test_inp, test_out = get_inp_out(
-                cali_xs[:1].to(device), 
-                cali_ts[:1].to(device),
-                cali_conds[:1].to(device)
-            )
-            
-        is_sm = False
-        if (isinstance(test_inp, tuple) and test_inp[0].shape[1] == test_inp[0].shape[2]):
-            logger.info(f"test_inp shape: {test_inp[0].shape}, {test_inp[1].shape}")
-            if test_inp[0].shape[1] == 4096:
-                is_sm = True
-        if test_out.shape[1] == test_out.shape[2]:
-            logger.info(f"test_out shape: {test_out.shape}")
-            if test_out.shape[1] == 4096:
-                is_sm = True
-        """    
-        if is_sm:
-            logger.info("Confirmed. Trading speed for memory when caching attn matrix calibration data")
-            inds = np.random.choice(cali_xs.size(0), cali_xs.size(0) // 2, replace=False)
-        else:
-            logger.info("Nope. Using normal caching method")
-    
-    
-    num = int(cali_xs.size(0) / batch_size)
-    if is_sm:
-        num //= 2
-    l_in_0, l_in_1, l_in, l_out = 0, 0, 0, 0
-    for i in trange(num):
-        if not cond:
-            cur_inp, cur_out = get_inp_out(
-                cali_xs[i * batch_size:(i + 1) * batch_size].to(device), 
-                cali_ts[i * batch_size:(i + 1) * batch_size].to(device)
-            ) if not is_sm else get_inp_out(
-                cali_xs[inds[i * batch_size:(i + 1) * batch_size]].to(device), 
-                cali_ts[inds[i * batch_size:(i + 1) * batch_size]].to(device)
-            )
-        else:
-            cur_inp, cur_out = get_inp_out(
-                cali_xs[i * batch_size:(i + 1) * batch_size].to(device), 
-                cali_ts[i * batch_size:(i + 1) * batch_size].to(device),
-                cali_conds[i * batch_size:(i + 1) * batch_size].to(device)
-            ) if not is_sm else get_inp_out(
-                cali_xs[inds[i * batch_size:(i + 1) * batch_size]].to(device), 
-                cali_ts[inds[i * batch_size:(i + 1) * batch_size]].to(device),
-                cali_conds[inds[i * batch_size:(i + 1) * batch_size]].to(device)
-            )
-        if isinstance(cur_inp, tuple):
-            # Diffusers Transformer Blk
-            # add self.data_saver.input_store[7] len should be 7 -> 8
-            if len(cur_inp) == 8:
-                cached_batches.append(((cur_inp[0],
-                                        cur_inp[1],
-                                        cur_inp[2],
-                                        cur_inp[3],
-                                        cur_inp[4],
-                                        cur_inp[5],
-                                        cur_inp[6],
-                                        cur_inp[7]), cur_out.cpu()))
-            else:
-                cur_x, cur_t = cur_inp
-                if not is_sm:
-                    cached_batches.append(((cur_x.cpu(), cur_t.cpu()), cur_out.cpu()))
-                else:
-                    if cached_inps is None:
-                        l_in_0 = cur_x.shape[0] * num
-                        l_in_1 = cur_t.shape[0] * num
-                        cached_inps = [torch.zeros(l_in_0, *cur_x.shape[1:]), torch.zeros(l_in_1, *cur_t.shape[1:])]
-                    cached_inps[0].index_copy_(0, torch.arange(i * cur_x.shape[0], (i + 1) * cur_x.shape[0]), cur_x.cpu())
-                    cached_inps[1].index_copy_(0, torch.arange(i * cur_t.shape[0], (i + 1) * cur_t.shape[0]), cur_t.cpu())
-        else:
-            if not is_sm:
-                cached_batches.append((cur_inp.cpu(), cur_out.cpu()))
-            else:
-                if cached_inps is None:
-                    l_in = cur_inp.shape[0] * num
-                    cached_inps = torch.zeros(l_in, *cur_inp.shape[1:])
-                cached_inps.index_copy_(0, torch.arange(i * cur_inp.shape[0], (i + 1) * cur_inp.shape[0]), cur_inp.cpu())
-        
-        if is_sm:
-            if cached_outs is None:
-                l_out = cur_out.shape[0] * num
-                cached_outs = torch.zeros(l_out, *cur_out.shape[1:])
-            cached_outs.index_copy_(0, torch.arange(i * cur_out.shape[0], (i + 1) * cur_out.shape[0]), cur_out.cpu())
-
-    if not is_sm:
-        # NOTE for error on this conditional, check if the above for-loop is actually executing it should go through a tqdm.
-        # add self.data_saver.input_store[7] len should be 7 -> 8
-        if isinstance(cached_batches[0][0], tuple) and len(cached_batches[0][0]) == 8:
-            cached_inps = [
-                torch.cat([x[0][0] for x in cached_batches]),
-                torch.cat([x[0][1] for x in cached_batches]) if cached_batches[0][0][1] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][2] for x in cached_batches]) if cached_batches[0][0][2] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][3] for x in cached_batches]) if cached_batches[0][0][3] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][4] for x in cached_batches]) if cached_batches[0][0][4] is not None else [None] * len(cached_batches),
-                [x[0][5] for x in cached_batches],
-                torch.cat([x[0][6] for x in cached_batches]) if cached_batches[0][0][6] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][7] for x in cached_batches]) if cached_batches[0][0][7] is not None else [None] * len(cached_batches),
-            ]
-        elif isinstance(cached_batches[0][0], tuple):
-            cached_inps = [
-                torch.cat([x[0][0] for x in cached_batches]), 
-                torch.cat([x[0][1] for x in cached_batches])
-            ]
-        else:
-            cached_inps = torch.cat([x[0] for x in cached_batches])
-        cached_outs = torch.cat([x[1] for x in cached_batches])
-    
-    #if isinstance(cached_inps, list):
-    #    logger.info(f"in 1 shape: {cached_inps[0].shape}, in 2 shape: {cached_inps[1].shape}")
-    #else:
-    #    logger.info(f"in shape: {cached_inps.shape}")
-    #logger.info(f"out shape: {cached_outs.shape}")
-    torch.cuda.empty_cache()
-    if keep_gpu:
-        if isinstance(cached_inps, list):
-            cached_inps[0] = cached_inps[0].to(device)
-            cached_inps[1] = cached_inps[1].to(device)
-        else:
-            cached_inps = cached_inps.to(device)
-        cached_outs = cached_outs.to(device)
-    return cached_inps, cached_outs
+        setattr(this_module, last_mod_name, value)
 
 
-def save_grad_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBlock], cali_data: torch.Tensor,
-                   damping: float = 1., act_quant: bool = False, batch_size: int = 32,
-                   keep_gpu: bool = True, weight_quant: bool = True):
+def search_for_zero_planes(model: torch.nn.Module):
+    """If list of modules to winnow is empty to start with, search through all modules to check
+    if any
+    planes have been zeroed out. Update self._list_of_modules_to_winnow with any findings.
+    :param model: torch model to search through modules for zeroed parameters
     """
-    Save gradient data of a particular layer/block over calibration dataset.
 
-    :param model: QuantModel
-    :param layer: QuantModule or QuantBlock
-    :param cali_data: calibration data set
-    :param damping: damping the second-order gradient by adding some constant in the FIM diagonal
-    :param act_quant: use activation quantization
-    :param batch_size: mini-batch size for calibration
-    :param keep_gpu: put saved data on GPU for faster optimization
-    :return: gradient data
+    list_of_modules_to_winnow = []
+    for _, module in model.named_modules():
+        if isinstance(module, (torch.nn.Linear, torch.nn.modules.conv.Conv2d)):
+            in_channels_to_winnow = _assess_weight_and_bias(module.weight, module.bias)
+            if in_channels_to_winnow:
+                list_of_modules_to_winnow.append((module, in_channels_to_winnow))
+    return list_of_modules_to_winnow
+
+
+def _assess_weight_and_bias(weight: torch.nn.Parameter, _bias: torch.nn.Parameter):
+    """4-dim weights [CH-out, CH-in, H, W] and 1-dim bias [CH-out]"""
+    if len(weight.shape) > 2:
+        input_channels_to_ignore = (weight.sum((0, 2, 3)) == 0).nonzero().squeeze().tolist()
+    else:
+        input_channels_to_ignore = (weight.sum(0) == 0).nonzero().squeeze().tolist()
+
+    if type(input_channels_to_ignore) != list:
+        input_channels_to_ignore = [input_channels_to_ignore]
+
+    return input_channels_to_ignore
+
+
+def seed_all(seed: int = 1029, deterministic: bool = False):
     """
-    device = next(model.parameters()).device
-    get_grad = GetLayerGrad(model, layer, device, act_quant=act_quant, weight_quant=weight_quant)
-    cached_batches = []
-    torch.cuda.empty_cache()
+    This is our attempt to make experiments reproducible by seeding all known RNGs and setting
+    appropriate torch directives.
+    For a general discussion of reproducibility in Pytorch and CUDA and a documentation of the
+    options we are using see, e.g.,
+    https://pytorch.org/docs/1.7.1/notes/randomness.html
+    https://docs.nvidia.com/cuda/cublas/index.html#cublasApi_reproducibility
 
-    for i in range(int(cali_data.size(0) / batch_size)):
-        cur_grad = get_grad(cali_data[i * batch_size:(i + 1) * batch_size])
-        cached_batches.append(cur_grad.cpu())
+    As of today (July 2021), even after seeding and setting some directives,
+    there remain unfortunate contradictions:
+    1. CUDNN
+    - having CUDNN enabled leads to
+      - non-determinism in Pytorch when using the GPU, cf. MORPH-10999.
+    - having CUDNN disabled leads to
+      - most regression tests in Qrunchy failing, cf. MORPH-11103
+      - significantly increased execution time in some cases
+      - performance degradation in some cases
+    2. torch.set_deterministic(d)
+    - setting d = True leads to errors for Pytorch algorithms that do not (yet) have a deterministic
+      counterpart, e.g., the layer `adaptive_avg_pool2d_backward_cuda` in vgg16__torchvision.
 
-    cached_grads = torch.cat([x for x in cached_batches])
-    cached_grads = cached_grads.abs() + 1.0
-    # scaling to make sure its mean is 1
-    # cached_grads = cached_grads * torch.sqrt(cached_grads.numel() / cached_grads.pow(2).sum())
-    torch.cuda.empty_cache()
-    if keep_gpu:
-        cached_grads = cached_grads.to(device)
-    return cached_grads
+    Thus, we leave the choice of enforcing determinism by disabling CUDNN and non-deterministic
+    algorithms to the user. To keep it simple, we only have one switch for both.
+    This situation could be re-evaluated upon updates of Pytorch, CUDA, CUDNN.
+    """
+
+    assert isinstance(seed, int), f"RNG seed must be an integer ({seed})"
+    assert seed >= 0, f"RNG seed must be a positive integer ({seed})"
+
+    # Builtin RNGs
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    # Numpy RNG
+    np.random.seed(seed)
+
+    # CUDNN determinism (setting those has not lead to errors so far)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    # Torch RNGs
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Problematic settings, see docstring. Precaution: We do not mutate unless asked to do so
+    if deterministic is True:
+        torch.backends.cudnn.enabled = False
+
+        torch.set_deterministic(True)  # Use torch.use_deterministic_algorithms(True) in torch 1.8.1
+        # When using torch.set_deterministic(True), it is advised by Pytorch to set the
+        # CUBLAS_WORKSPACE_CONFIG variable as follows, see
+        # https://pytorch.org/docs/1.7.1/notes/randomness.html#avoiding-nondeterministic-algorithms
+        # and the link to the CUDA homepage on that website.
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+
+def assert_allclose(actual, desired, *args, **kwargs):
+    """A more beautiful version of torch.all_close."""
+    np.testing.assert_allclose(to_numpy(actual), to_numpy(desired), *args, **kwargs)
+
+
+def count_params(module):
+    return len(nn.utils.parameters_to_vector(module.parameters()))
 
 
 class StopForwardException(Exception):
-    """
-    Used to throw and catch an exception to stop traversing the graph
-    """
+    """Used to throw and catch an exception to stop traversing the graph."""
+
     pass
 
 
-class DataSaverHook:
+class StopForwardHook:
+    def __call__(self, module, *args):
+        raise StopForwardException
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+class CosineTempDecay:
+    def __init__(self, t_max, temp_range=(20.0, 2.0), rel_decay_start=0):
+        self.t_max = t_max
+        self.start_temp, self.end_temp = temp_range
+        self.decay_start = rel_decay_start * t_max
+
+    def __call__(self, t):
+        if t < self.decay_start:
+            return self.start_temp
+
+        rel_t = (t - self.decay_start) / (self.t_max - self.decay_start)
+        return self.end_temp + 0.5 * (self.start_temp - self.end_temp) * (1 + np.cos(rel_t * np.pi))
+
+
+class BaseEnumOptions(Flag):
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def list_names(cls):
+        return [m.name for m in cls]
+
+
+class ClassEnumOptions(BaseEnumOptions):
+    @property
+    def cls(self):
+        return self.value.cls
+
+    def __call__(self, *args, **kwargs):
+        return self.value.cls(*args, **kwargs)
+
+
+MethodMap = partial(namedtuple("MethodMap", ["value", "cls"]), auto())
+
+
+def split_dict(src: dict, include=(), remove_prefix: str = ""):
     """
-    Forward hook that stores the input and output of a block
+    Splits dictionary into a DotDict and a remainder.
+    The arguments to be placed in the first DotDict are those listed in `include`.
+    Parameters
+    ----------
+    src: dict
+        The source dictionary.
+    include:
+        List of keys to be returned in the first DotDict.
+    remove_suffix:
+        remove prefix from key
     """
-    def __init__(self, store_input=False, store_output=False, stop_forward=False):
-        self.store_input = store_input
-        self.store_output = store_output
-        self.stop_forward = stop_forward
+    result = DotDict()
 
-        self.input_store = None
-        self.output_store = None
-
-    def __call__(self, module, input_batch, output_batch):
-        if self.store_input:
-            self.input_store = input_batch
-            if hasattr(module, "ts_cache"):
-                self.input_store = (input_batch[0],
-                                    module.am_cache,
-                                    module.ehs_cache,
-                                    module.eam_cache,
-                                    module.ts_cache,
-                                    module.cak_cache,
-                                    module.class_labels,
-                                    module.added_cond_kwargs)  # add module.added_cond_kwargs
-        if self.store_output:
-            self.output_store = output_batch
-        if self.stop_forward:
-            raise StopForwardException
-
-
-class GetLayerInpOut:
-    def __init__(self, model: QuantModel, layer: Union[QuantModule, BaseQuantBlock],
-                 device: torch.device, asym: bool = False, act_quant: bool = False,
-                 weight_quant: bool = True):
-        self.model = model
-        self.layer = layer
-        self.asym = asym
-        self.device = device
-        self.act_quant = act_quant
-        self.weight_quant = weight_quant
-        self.data_saver = DataSaverHook(store_input=True, store_output=True, stop_forward=True)
-
-    def __call__(self, x, timesteps, context=None):
-        self.model.eval()
-        self.model.set_quant_state(False, False)
-
-        assert context is not None
-        handle = self.layer.register_forward_hook(self.data_saver)
-        with torch.no_grad():
-            try:
-                # NOTE BRECQ issues
-                #_ = self.model(x, timesteps, context)
-                #_ = self.model(x, timestep=timesteps, class_labels=context)
-                _ = self.model(x, timestep=timesteps, encoder_hidden_states=context, added_cond_kwargs = pixart_alpha_aca_dict(x))
-            except StopForwardException:
-                pass
-
-            if self.asym:
-                # Recalculate input with network quantized
-                self.data_saver.store_output = False
-                self.model.set_quant_state(weight_quant=self.weight_quant, act_quant=self.act_quant)
-                try:
-                    # NOTE BRECQ issues.
-                    #_ = self.model(x, timesteps, context)
-                    #_ = self.model(x, timestep=timesteps, class_labels=context)
-                    _ = self.model(x, timestep=timesteps, encoder_hidden_states=context, added_cond_kwargs = pixart_alpha_aca_dict(x))
-                except StopForwardException:
-                    pass
-                self.data_saver.store_output = True
-
-        handle.remove()
-
-        self.model.set_quant_state(False, False)
-        self.layer.set_quant_state(self.weight_quant, self.act_quant)
-        self.model.train()
-
-        # NOTE For Diffusers compat.
-        # TODO also required for QuantDiffRB
-        # add self.data_saver.input_store[7]
-        if isinstance(self.layer, QuantDiffBTB):
-            return (self.data_saver.input_store[0].detach().cpu(),
-                    self.data_saver.input_store[1].detach().cpu() if self.data_saver.input_store[1] is not None else None,
-                    self.data_saver.input_store[2].detach().cpu() if self.data_saver.input_store[2] is not None else None,
-                    self.data_saver.input_store[3].detach().cpu() if self.data_saver.input_store[3] is not None else None,
-                    self.data_saver.input_store[4].detach().cpu() if self.data_saver.input_store[4] is not None else None,
-                    self.data_saver.input_store[5].detach().cpu() if self.data_saver.input_store[5] is not None else None,
-                    self.data_saver.input_store[6].detach().cpu() if self.data_saver.input_store[6] is not None else None,
-                    self.data_saver.input_store[7].detach().cpu() if self.data_saver.input_store[7] is not None else None), self.data_saver.output_store.detach().cpu()
-
-        elif len(self.data_saver.input_store) > 1 and torch.is_tensor(self.data_saver.input_store[1]):
-            return (self.data_saver.input_store[0].detach(),  
-                self.data_saver.input_store[1].detach()), self.data_saver.output_store.detach()
+    for arg in include:
+        if remove_prefix:
+            key = arg.replace(f"{remove_prefix}_", "", 1)
         else:
-            return self.data_saver.input_store[0].detach(), self.data_saver.output_store.detach()
+            key = arg
+        result[key] = src[arg]
+    remainder = {key: val for key, val in src.items() if key not in include}
+    return result, remainder
 
 
-class GradSaverHook:
-    def __init__(self, store_grad=True):
-        self.store_grad = store_grad
-        self.stop_backward = False
-        self.grad_out = None
-
-    def __call__(self, module, grad_input, grad_output):
-        if self.store_grad:
-            self.grad_out = grad_output[0]
-        if self.stop_backward:
-            raise StopForwardException
-
-
-class GetLayerGrad:
-    def __init__(self, model: QuantModel, layer: Union[QuantModule, BaseQuantBlock],
-                 device: torch.device, act_quant: bool = False, weight_quant: bool = True):
-        self.model = model
-        self.layer = layer
-        self.device = device
-        self.act_quant = act_quant
-        self.weight_quant = weight_quant
-        self.data_saver = GradSaverHook(True)
-
-    def __call__(self, model_input):
-        """
-        Compute the gradients of block output, note that we compute the
-        gradient by calculating the KL loss between fp model and quant model
-
-        :param model_input: calibration data samples
-        :return: gradients
-        """
-        self.model.eval()
-
-        handle = self.layer.register_backward_hook(self.data_saver)
-        with torch.enable_grad():
-            try:
-                self.model.zero_grad()
-                inputs = model_input.to(self.device)
-                self.model.set_quant_state(False, False)
-                out_fp = self.model(inputs)
-                quantize_model_till(self.model, self.layer, self.act_quant, self.weight_quant)
-                out_q = self.model(inputs)
-                loss = F.kl_div(F.log_softmax(out_q, dim=1), F.softmax(out_fp, dim=1), reduction='batchmean')
-                loss.backward()
-            except StopForwardException:
-                pass
-
-        handle.remove()
-        self.model.set_quant_state(False, False)
-        self.layer.set_quant_state(self.weight_quant, self.act_quant)
-        self.model.train()
-        return self.data_saver.grad_out.data
-
-
-def quantize_model_till(model: QuantModule, layer: Union[QuantModule, BaseQuantBlock], act_quant: bool = False,
-                        weight_quant: bool = True):
+class ClickEnumOption(click.Choice):
     """
-    We assumes modules are correctly ordered, holds for all models considered
-    :param model: quantized_model
-    :param layer: a block or a single layer.
+    Adjusted click.Choice type for BaseOption which is based on Enum
     """
-    model.set_quant_state(False, False)
-    for name, module in model.named_modules():
-        if isinstance(module, (QuantModule, BaseQuantBlock)):
-            module.set_quant_state(weight_quant, act_quant)
-        if module == layer:
-            break
 
+    def __init__(self, enum_options, case_sensitive=True):
+        assert issubclass(enum_options, BaseEnumOptions)
+        self.base_option = enum_options
+        super().__init__(self.base_option.list_names(), case_sensitive)
 
-def get_train_samples(args, sample_data, custom_steps=None):
-    num_samples, num_st = args.cali_n, args.cali_st
-    custom_steps = args.custom_steps if custom_steps is None else custom_steps
-    if num_st == 1:
-        xs = sample_data[:num_samples]
-        ts = (torch.ones(num_samples) * 800)
-    else:
-        # get the real number of timesteps (especially for DDIM)
-        nsteps = len(sample_data["ts"])
-        assert(nsteps >= custom_steps)
-        timesteps = list(range(0, nsteps, nsteps//num_st))
-        logger.info(f'Selected {len(timesteps)} steps from {nsteps} sampling steps')
-        xs_lst = [sample_data["xs"][i][:num_samples] for i in timesteps]
-        ts_lst = [sample_data["ts"][i][:num_samples] for i in timesteps]
-        if args.cond:
-            xs_lst += xs_lst
-            ts_lst += ts_lst
-            conds_lst = [sample_data["cs"][i][:num_samples] for i in timesteps] + [sample_data["ucs"][i][:num_samples] for i in timesteps]
-        xs = torch.cat(xs_lst, dim=0)
-        ts = torch.cat(ts_lst, dim=0)
-        if args.cond:
-            conds = torch.cat(conds_lst, dim=0)
-            return xs, ts, conds
-    return xs, ts
+    def convert(self, value, param, ctx):
+        # Exact match
+        if value in self.choices:
+            return self.base_option[value]
 
+        # Match through normalization and case sensitivity
+        # first do token_normalize_func, then lowercase
+        # preserve original `value` to produce an accurate message in
+        # `self.fail`
+        normed_value = value
+        normed_choices = self.choices
 
-def get_train_samples_custom(args, sample_data, custom_steps=None):
-    return get_train_samples_custom_ucs(args, sample_data, custom_steps)
-    num_samples, num_st = args.cali_n, args.cali_st
+        if ctx is not None and ctx.token_normalize_func is not None:
+            normed_value = ctx.token_normalize_func(value)
+            normed_choices = [ctx.token_normalize_func(choice) for choice in self.choices]
 
-    # get the real number of timesteps (especially for DDIM)
-    nsteps = len(sample_data["ts"])
-    assert(nsteps >= custom_steps)
-    timesteps = list(range(0, nsteps, nsteps//num_st))
-    logger.info(f'Selected {len(timesteps)} steps from {nsteps} sampling steps')
-    xs_lst = [sample_data["xs"][i][:num_samples] for i in timesteps]
-    ts_lst = [sample_data["ts"][i][:num_samples] for i in timesteps]
-    conds_lst = [sample_data["cs"][i][:num_samples] for i in timesteps]
-    xs = torch.cat(xs_lst, dim=0)
-    ts = torch.cat(ts_lst, dim=0)
-    conds = torch.cat(conds_lst, dim=0)
-    return xs, ts, conds
+        if not self.case_sensitive:
+            normed_value = normed_value.lower()
+            normed_choices = [choice.lower() for choice in normed_choices]
 
-def get_train_samples_custom_ucs(args, sample_data, custom_steps=None):
-    num_samples, num_st = args.cali_n, args.cali_st
+        if normed_value in normed_choices:
+            return self.base_option[normed_value]
 
-    # get the real number of timesteps (especially for DDIM)
-    nsteps = len(sample_data["ts"])
-    assert(nsteps >= custom_steps)
-    timesteps = list(range(0, nsteps, nsteps//num_st))
-    logger.info(f'Selected {len(timesteps)} steps from {nsteps} sampling steps')
-    xs_lst = [sample_data["xs"][i][:num_samples] for i in timesteps]
-    ts_lst = [sample_data["ts"][i][:num_samples] for i in timesteps]
-    if (args.cond) and ("ucs" in sample_data):
-        xs_lst += xs_lst
-        ts_lst += ts_lst
-        conds_lst = [sample_data["cs"][i][:num_samples] for i in timesteps] + [sample_data["ucs"][i][:num_samples] for i in timesteps]
-    xs = torch.cat(xs_lst, dim=0)
-    ts = torch.cat(ts_lst, dim=0)
-    conds = torch.cat(conds_lst, dim=0)
-    return xs, ts, conds
-
-
-
-def get_train_samples_sdxl(args, sample_data, custom_steps=None):
-    num_samples, num_st = args.cali_n, args.cali_st
-
-    # get the real number of timesteps (especially for DDIM)
-    nsteps = len(sample_data["ts"])
-    assert(nsteps >= custom_steps)
-    timesteps = list(range(0, nsteps, nsteps//num_st))
-    logger.info(f'Selected {len(timesteps)} steps from {nsteps} sampling steps')
-    xs_lst = [sample_data["xs"][i][:num_samples] for i in timesteps]
-    ts_lst = [sample_data["ts"][i][:num_samples] for i in timesteps]
-    conds_lst = [sample_data["cs"][i][:num_samples] for i in timesteps]
-    tes = sample_data["text_embeds"][:num_samples]
-    tid = sample_data["time_ids"]
-    xs = torch.cat(xs_lst, dim=0)
-    ts = torch.cat(ts_lst, dim=0)
-    conds = torch.cat(conds_lst, dim=0)
-    return xs, ts, conds, tes, tid
-
-
-def convert_adaround(model):
-    for name, module in model.named_children():
-        if isinstance(module, QuantModule):
-            if module.ignore_reconstruction is True:
-                # logger.info('Ignore reconstruction of layer {}'.format(name))
-                continue
-            else:
-                # logger.info('Change layer {} to adaround'.format(name))
-                module.weight_quantizer = AdaRoundQuantizer(uaq=module.weight_quantizer, round_mode='learned_hard_sigmoid',
-                                                   weight_tensor=module.org_weight.data)
-        elif isinstance(module, BaseQuantBlock):
-            if module.ignore_reconstruction is True:
-                # logger.info('Ignore reconstruction of block {}'.format(name))
-                continue
-            else:
-                # logger.info('Change block {} to adaround'.format(name))
-                for name, sub_module in module.named_modules():
-                    if isinstance(sub_module, QuantModule):
-                        if sub_module.split != 0:
-                            # print(f"split {name}")
-                            sub_module.weight_quantizer = AdaRoundQuantizer(uaq=sub_module.weight_quantizer, round_mode='learned_hard_sigmoid',
-                                                                    weight_tensor=sub_module.org_weight.data[:, :sub_module.split, ...])
-                            sub_module.weight_quantizer_0 = AdaRoundQuantizer(uaq=sub_module.weight_quantizer_0, round_mode='learned_hard_sigmoid',
-                                                                    weight_tensor=sub_module.org_weight.data[:, sub_module.split:, ...])
-                        else:
-                            sub_module.weight_quantizer = AdaRoundQuantizer(uaq=sub_module.weight_quantizer, round_mode='learned_hard_sigmoid',
-                                                                    weight_tensor=sub_module.org_weight.data)
-        else:
-            convert_adaround(module)
-
-
-# qnn is model
-# ckpt_path is where to store quantized weights
-# cali_data is calibration data. But loaded. E.g., for resume its randomly generated
-def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode='qdiff',
-                      cond=False, weight_quant=True):
-    print("Loading quantized model checkpoint")
-    ckpt = torch.load(ckpt_path, map_location='cpu')
-    cali_xs, cali_ts, cali_cs = None, None, None
-
-    if not cond:
-        cali_xs, cali_ts = cali_data
-    elif len(cali_data) == 5:
-        cali_xs, cali_ts, cali_cs, cali_tes, cali_tid = cali_data
-    else:
-        cali_xs, cali_ts, cali_cs = cali_data
-
-    if weight_quant:
-        print("Initializing weight quantization parameters")
-        qnn.set_quant_state(True, False)
-        if not cond:
-            _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda())
-        # NOTE Exception for SDXL
-        elif len(cali_data) == 5:
-            _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda(), encoder_hidden_states=cali_cs[:1].cuda(), added_cond_kwargs={"text_embeds": cali_tes[:1].cuda(), "time_ids": cali_tid.cuda()}, cross_attention_kwargs={}, return_dict=False)
-        elif len(cali_data) == 4:
-            # TODO fix when required.
-            with torch.no_grad():
-                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
-        else:
-            # NOTE this is what is used by PixArt
-            cali_xs = cali_xs.to(torch.float16)
-            cali_cs = cali_cs.to(torch.float16)
-            with torch.no_grad():
-                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
-        # change weight quantizer from uniform to adaround
-        # e.g., prior to calling convert adaround, must pass data through.
-        # this generates deltas in weights - the distribution of cali data does not matter.
-        # NOTE: --resume only works for AdaRound weights quantization
-        convert_adaround(qnn)
-
-        # Make the zero_point and delta parameters
-        for m in qnn.model.modules():
-            if isinstance(m, AdaRoundQuantizer):
-                m.zero_point = nn.Parameter(m.zero_point)
-                m.delta = nn.Parameter(m.delta)
-
-        # remove act_quantizer states for now
-        keys = [key for key in ckpt.keys() if "act" in key]
-        for key in keys:
-            del ckpt[key]
-        qnn.load_state_dict(ckpt, strict=(act_quant_mode=='qdiff'))
-        qnn.set_quant_state(weight_quant=True, act_quant=False)
-
-        # Now this seems to be reversing what we did about parameters.
-        # It seems they are only set as parameters for storage in state_dict
-        for m in qnn.model.modules():
-            if isinstance(m, AdaRoundQuantizer):
-                zero_data = m.zero_point.data
-                delattr(m, "zero_point")
-                m.zero_point = zero_data
-
-                delta_data = m.delta.data
-                delattr(m, "delta")
-                m.delta = delta_data
-
-    # This conditional makes the code look so very hacky...
-    if quant_act:       
-        print("Initializing act quantization parameters")
-        qnn.set_quant_state(weight_quant, True)
-        if not cond:
-            _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda())
-        # NOTE Exception for SDXL, doesn't work
-        elif len(cali_data) == 4:
-            #cali_xs, cali_ts, cali_cs, cali_tes, cali_tid = cali_data
-            #_ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda(), encoder_hidden_states=cali_cs[:1].cuda(), added_cond_kwargs={"text_embeds": cali_tes[:1].cuda(), "time_ids": cali_tid.cuda()}, cross_attention_kwargs={}, return_dict=False)
-            cali_xs = cali_data['xs'][0].to(torch.float16) 
-            cali_ts = cali_data['ts'][0]
-            cali_cs = cali_data['cs'][0].to(torch.float16)
-            # If you do not wrap in torch.no_grad, V100 runs out of VRAM.
-            with torch.no_grad():
-                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
-        else:
-            # NOTE PixArt
-            cali_xs = cali_xs.to(torch.float16)
-            cali_cs = cali_cs.to(torch.float16)
-            with torch.no_grad():
-                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
-        print("Loading quantized model checkpoint again")
-        
-        for m in qnn.model.modules():
-            if isinstance(m, AdaRoundQuantizer):
-                m.zero_point = nn.Parameter(m.zero_point)
-                m.delta = nn.Parameter(m.delta)
-            elif isinstance(m, UniformAffineQuantizer):
-                if m.zero_point is not None:
-                    if not torch.is_tensor(m.zero_point):
-                        m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
-                    else:
-                        m.zero_point = nn.Parameter(m.zero_point)
-                    
-        ckpt = torch.load(ckpt_path, map_location='cpu')
-        qnn.load_state_dict(ckpt, strict=weight_quant)
-        qnn.set_quant_state(weight_quant=weight_quant, act_quant=True)
-        
-        for m in qnn.model.modules():
-            if isinstance(m, AdaRoundQuantizer):
-                zero_data = m.zero_point.data
-                delattr(m, "zero_point")
-                m.zero_point = zero_data
-
-                delta_data = m.delta.data
-                delattr(m, "delta")
-                m.delta = delta_data
-            elif isinstance(m, UniformAffineQuantizer):
-                if m.zero_point is not None:
-                    zero_data = m.zero_point.item()
-                    delattr(m, "zero_point")
-                    assert(int(zero_data) == zero_data)
-                    m.zero_point = int(zero_data)
-
-
-def greedy_core_set_selection(unique_points, size, dist_func, verbose=True):
-    """
-    Naive implementation of algorithm 1 in SmallGAN
-    """
-    assert len(unique_points) >= size, \
-        "Specified core set size: {} larger than number of points: {}".format(size, len(unique_points))
-    bar = None
-    if verbose:
-        from tqdm import tqdm
-        bar = tqdm(total=size, desc="Greedy core set selection", ascii=True)
-    remaining_points = [v for v in unique_points]
-    random.shuffle(remaining_points)
-    core_set = [remaining_points[0]]
-    remaining_points = remaining_points[1:]
-    memo = {}
-    while len(core_set) < size:
-        max_dist = None
-        cand_point_idx = None
-        for pi, p1 in enumerate(remaining_points):
-            min_dist = min(dist_func(p1, p2, memo) for p2 in core_set)
-            if max_dist is None or min_dist > max_dist:
-                max_dist = min_dist
-                cand_point_idx = pi
-        assert cand_point_idx is not None
-        core_set.append(remaining_points[cand_point_idx])
-        if bar is not None: bar.update(1)
-        del remaining_points[cand_point_idx]
-    if bar is not None: bar.close()
-    return core_set, memo
-
-
-def pixart_alpha_aca_dict(x):
-    bs = x.shape[0]
-    hw = x.shape[2] * 8
-    device = x.device
-    dtype = x.dtype if torch.is_floating_point(x) else torch.float16
-    return {
-        'resolution': torch.tensor([[hw, hw]], device=device, dtype=dtype).expand(bs, -1),
-        'aspect_ratio': torch.tensor([[1.0]], device=device, dtype=dtype).expand(bs, -1),
-    }
+        self.fail(
+            "invalid choice: %s. (choose from %s)" % (value, ", ".join(self.choices)), param, ctx
+        )
