@@ -16,6 +16,75 @@ Target models and data:
 - Q-DiT: integer PTQ baseline with group quantization and dynamic quantization.
 - FP4DiT: floating-point PTQ with module-aware precision and scale-aware rounding.
 
+
+## Mind Map
+
+```mermaid
+flowchart TB
+
+subgraph PHASE1 [Phase 1 Calibration Data Generation]
+    COCO["COCO Dataset 512x512"]
+    VAE["VAE Encoder"]
+    LATENTS["Latents 4x64x64"]
+    NOISE["Add Gaussian Noise (20 timesteps)"]
+    PROMPTS["Encode Captions (T5-XXL)"]
+    CALIB["Save pixart_calib_brecq.pt"]
+
+    COCO --> VAE --> LATENTS --> NOISE --> PROMPTS --> CALIB
+end
+
+subgraph PHASE2 [Phase 2 Weight Quantization]
+    LOAD["Load PixArt-alpha 1024-MS"]
+    QMODEL["Wrap Layers with QuantModel"]
+    INIT["Initialize Scales / Zero Points"]
+    BRANCH{"--disable_fp_quant ?"}
+    
+    LOAD --> QMODEL --> INIT --> BRANCH
+end
+
+subgraph FP4_PATH [FP4 + BRECQ Path]
+    FP_Q["UniformAffineQuantizer fp=True"]
+    BRECQ["BRECQ Reconstruction"]
+    ADAROUND["AdaRound Optimization"]
+    FP_DONE["FP4 Quantized Weights"]
+
+    FP_Q --> BRECQ --> ADAROUND --> FP_DONE
+end
+
+subgraph INT4_PATH [INT4 + GPTQ Path]
+    INT_Q["UniformAffineQuantizer fp=False"]
+    HESSIAN["Estimate H = X^T X / n"]
+    CHOL["Cholesky Inversion"]
+    COLQUANT["GPTQ Column Quantization"]
+    INT_DONE["INT4 Quantized Weights"]
+
+    INT_Q --> HESSIAN --> CHOL --> COLQUANT --> INT_DONE
+end
+
+subgraph PHASE3 [Phase 3 Activation Calibration]
+    ACTINIT["Collect Activations (16 samples)"]
+    RUNSTAT["EMA Min/Max Stats"]
+    ACTRECON["BRECQ Activation Reconstruction"]
+    ACTDONE["Fully Quantized Model W4A8"]
+
+    ACTINIT --> RUNSTAT --> ACTRECON --> ACTDONE
+end
+
+subgraph PHASE4 [Phase 4 Generation & Evaluation]
+    GEN["Generate 10k COCO Images"]
+    EVAL["Compute FID / sFID / CLIP"]
+
+    GEN --> EVAL
+end
+
+CALIB --> LOAD
+BRANCH -- No --> FP_Q
+BRANCH -- Yes --> INT_Q
+FP_DONE --> ACTINIT
+INT_DONE --> ACTINIT
+ACTDONE --> GEN
+```
+
 ## Progress So Far
 Completed on Q-DiT side:
 - Calibration data collection pipeline
