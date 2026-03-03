@@ -55,6 +55,16 @@ class GPTQ:
         self.H = torch.zeros((self.columns, self.columns), device='cpu', dtype=torch.float32)
         self.nsamples = 0
         self.original_shape = W.shape
+        
+        # Store conv metadata for proper input unfolding in add_batch
+        self.is_conv2d = (len(W.shape) == 4)
+        if self.is_conv2d:
+            self.kernel_size = (W.shape[2], W.shape[3])
+            # Get conv parameters from the QuantModule
+            fwd_kwargs = layer.fwd_kwargs
+            self.stride = fwd_kwargs.get('stride', (1, 1))
+            self.padding = fwd_kwargs.get('padding', (0, 0))
+            self.dilation = fwd_kwargs.get('dilation', (1, 1))
 
     def add_batch(self, inp: torch.Tensor):
         """
@@ -67,12 +77,17 @@ class GPTQ:
         inp = inp.detach().float()
         
         # Flatten to 2D: (total_tokens, in_features)
-        if len(inp.shape) == 3:
+        if self.is_conv2d:
+            # Conv2d input: (batch, C_in, H, W) → unfold to patches
+            # Each patch has C_in * kH * kW features, matching self.columns
+            inp = torch.nn.functional.unfold(
+                inp, self.kernel_size, 
+                dilation=self.dilation, padding=self.padding, stride=self.stride
+            )  # → (batch, C_in*kH*kW, n_patches)
+            inp = inp.permute(0, 2, 1)  # → (batch, n_patches, C_in*kH*kW)
+            inp = inp.reshape(-1, inp.shape[-1])  # → (total_patches, columns)
+        elif len(inp.shape) == 3:
             inp = inp.reshape(-1, inp.shape[-1])
-        elif len(inp.shape) == 4:  # Conv2d input: (batch, C, H, W)
-            # Unfold to patches matching the conv kernel
-            # For simplicity, we treat conv as matrix multiply
-            inp = inp.reshape(-1, inp.shape[1])
         elif len(inp.shape) == 2:
             pass  # Already (batch, in_features)
         
@@ -173,11 +188,22 @@ class GPTQ:
         # Get the weight quantizer and initialize it with the full weight
         weight_quantizer = self.layer.weight_quantizer
         
+        # GPTQ manages column groups itself, so we must disable the quantizer's
+        # internal group_quant reshape (it would double-reshape the data).
+        # We also use 'max' for scale init since GPTQ handles error compensation.
+        orig_group_quant = weight_quantizer.group_quant
+        orig_scale_method = weight_quantizer.scale_method
+        weight_quantizer.group_quant = False
+        weight_quantizer.scale_method = 'max'
+        
         # Initialize quantizer scale/zero_point from the full weight tensor
         # This gives us the per-channel (or per-tensor) delta and zero_point
-        weight_quantizer.inited = torch.tensor(False)
+        # NOTE: Must use plain Python bool, NOT torch.tensor(False), because
+        # the quantizer checks `if self.inited is False:` — Python `is` checks
+        # identity, and torch.tensor(False) is not the Python False singleton.
+        weight_quantizer.inited = False
         _ = weight_quantizer(W.reshape(self.original_shape) if len(self.original_shape) == 4 else W)
-        weight_quantizer.inited = torch.tensor(True)
+        weight_quantizer.inited = True
         
         # Process columns in blocks
         num_blocks = (self.columns + blocksize - 1) // blocksize
@@ -207,9 +233,10 @@ class GPTQ:
                     group_end = min(group_start + group_size, self.columns)
                     group_w = W[:, group_start:group_end]
                     # Re-init quantizer with this group's range
-                    weight_quantizer.inited = torch.tensor(False)
+                    # (group_quant is already disabled, so no double-reshape)
+                    weight_quantizer.inited = False
                     _ = weight_quantizer(group_w)
-                    weight_quantizer.inited = torch.tensor(True)
+                    weight_quantizer.inited = True
                 
                 # Quantize the column directly (bypass the quantizer's forward
                 # to avoid re-initialization issues — use stored delta/zero_point)
@@ -233,6 +260,10 @@ class GPTQ:
         avg_loss = torch.sum(Losses).item() / self.rows
         logger.info("GPTQ quantization loss for %s: %.6f",
                     getattr(self.layer, 'nametag', 'unknown'), avg_loss)
+        
+        # Restore quantizer settings that GPTQ temporarily modified
+        weight_quantizer.group_quant = orig_group_quant
+        weight_quantizer.scale_method = orig_scale_method
         
         # Reshape back
         Q = Q.reshape(W_shape)
