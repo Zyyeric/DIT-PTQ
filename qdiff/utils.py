@@ -513,12 +513,12 @@ def convert_adaround(model):
 # qnn is model
 # ckpt_path is where to store quantized weights
 # cali_data is calibration data. But loaded. E.g., for resume its randomly generated
-def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode='qdiff', cond=False):
+def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode='qdiff', cond=False, use_gptq=False):
     print("Loading quantized model checkpoint")
     ckpt = torch.load(ckpt_path, map_location='cpu')
     
     print("Initializing weight quantization parameters")
-    qnn.set_quant_state(True, False)
+    qnn.set_quant_state(not use_gptq, False)
     if not cond:
         cali_xs, cali_ts = cali_data
         _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda())
@@ -539,24 +539,22 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
         with torch.no_grad():
             _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
     # change weight quantizer from uniform to adaround
-    # e.g., prior to calling convert adaround, must pass data through. 
-    # this generates deltas in weights - the distribution of cali data does not matter. 
-    # NOTE: I think this is actually just so they exist so other ones can be loaded.
-    # NOTE: --resume only works for AdaRound weights quantization
-    convert_adaround(qnn)
+    # GPTQ path doesn't use AdaRound, skip this conversion
+    if not use_gptq:
+        convert_adaround(qnn)
     
-    # Make the zero_point and delta parameters
-    for m in qnn.model.modules():
-        if isinstance(m, AdaRoundQuantizer):
-            m.zero_point = nn.Parameter(m.zero_point)
-            m.delta = nn.Parameter(m.delta)
+        # Make the zero_point and delta parameters
+        for m in qnn.model.modules():
+            if isinstance(m, AdaRoundQuantizer):
+                m.zero_point = nn.Parameter(m.zero_point)
+                m.delta = nn.Parameter(m.delta)
 
     # remove act_quantizer states for now
     keys = [key for key in ckpt.keys() if "act" in key]
     for key in keys:
         del ckpt[key]
-    qnn.load_state_dict(ckpt, strict=(act_quant_mode=='qdiff'))
-    qnn.set_quant_state(weight_quant=True, act_quant=False)
+    qnn.load_state_dict(ckpt, strict=False)
+    qnn.set_quant_state(weight_quant=not use_gptq, act_quant=False)
     
     # Now this seems to be reversing what we did about parameters. 
     # It seems they are only set as parameters for storage in state_dict
@@ -573,7 +571,7 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
     # This conditional makes the code look so very hacky...
     if quant_act:       
         print("Initializing act quantization parameters")
-        qnn.set_quant_state(True, True)
+        qnn.set_quant_state(not use_gptq, True)
         if not cond:
             _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda())
         # NOTE Exception for SDXL, doesn't work
@@ -634,7 +632,7 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
             logger.warning("resume_cali_model: %d missing keys (first 5: %s)", len(missing), missing[:5])
         if unexpected:
             logger.warning("resume_cali_model: %d unexpected keys (first 5: %s)", len(unexpected), unexpected[:5])
-        qnn.set_quant_state(weight_quant=True, act_quant=True)
+        qnn.set_quant_state(weight_quant=not use_gptq, act_quant=True)
         
         for m in qnn.model.modules():
             if isinstance(m, AdaRoundQuantizer):

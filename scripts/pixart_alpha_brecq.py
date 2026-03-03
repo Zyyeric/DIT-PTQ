@@ -622,7 +622,7 @@ def main():
             logger.info("Loaded calibration data from %s", opt.cali_data_path)
             cali_data = get_train_samples_custom(opt, sample_data, opt.ddim_steps)
             logger.info("Resuming calibrated model from %s", opt.cali_ckpt)
-            resume_cali_model(qnn, opt.cali_ckpt, cali_data, opt.quant_act, "qdiff", cond=opt.cond)
+            resume_cali_model(qnn, opt.cali_ckpt, cali_data, opt.quant_act, "qdiff", cond=opt.cond, use_gptq=use_gptq)
         else:
             logger.info("Loading calibration data from %s ...", opt.cali_data_path)
             _t0 = _time.time()
@@ -646,7 +646,7 @@ def main():
 
             cali_xs, cali_ts, cali_cs = cali_data
             if opt.resume_w:
-                resume_cali_model(qnn, opt.cali_ckpt, cali_data, False, cond=opt.cond)
+                resume_cali_model(qnn, opt.cali_ckpt, cali_data, False, cond=opt.cond, use_gptq=use_gptq)
             else:
                 logger.info("Initializing weight quantization parameters")
 
@@ -745,7 +745,9 @@ def main():
                     logger.info("Using BRECQ+AdaRound for weight calibration (iters=%d)", opt.cali_iters)
                     recon_model(qnn)
                 logger.info("Weight calibration completed in %.1fs", _time.time() - _t0)
-                qnn.set_quant_state(weight_quant=True, act_quant=False)
+                # For GPTQ: keep weight_quant=False since GPTQ already baked
+                # quantized values into org_weight. Re-quantizing would destroy them.
+                qnn.set_quant_state(weight_quant=not use_gptq, act_quant=False)
                 if use_ddp:
                     dist.barrier()
                 # Save checkpoint
@@ -771,7 +773,7 @@ def main():
                 logger.info(model.transformer)                    
                 logger.info("Doing activation calibration")
                 # Initialize activation quantization parameters
-                qnn.set_quant_state(True, True)
+                qnn.set_quant_state(not use_gptq, True)
                 with torch.no_grad():
                     inds = np.random.choice(cali_xs.shape[0], 16, replace=False)
                     _ = qnn(
@@ -795,16 +797,21 @@ def main():
                         qnn.set_running_stat(False, opt.rs_sm_only)
 
                 # TODO change these guys too.
-                kwargs = dict(
-                    cali_data=cali_data, batch_size=opt.cali_batch_size, iters=opt.cali_iters_a, act_quant=True, 
-                    opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p, cond=opt.cond,
-                    sequential=opt.sequential_a, multi_gpu=use_ddp)
-                recon_model(qnn)
-                qnn.set_quant_state(weight_quant=True, act_quant=True)
+                # Skip activation reconstruction for GPTQ path:
+                # block_recon and layer_recon internally set weight_quant=True
+                # which would double-quantize GPTQ's already-quantized weights.
+                # Running stat (above) is sufficient for GPTQ act calibration.
+                if not use_gptq:
+                    kwargs = dict(
+                        cali_data=cali_data, batch_size=opt.cali_batch_size, iters=opt.cali_iters_a, act_quant=True, 
+                        opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p, cond=opt.cond,
+                        sequential=opt.sequential_a, multi_gpu=use_ddp)
+                    recon_model(qnn)
+                qnn.set_quant_state(weight_quant=not use_gptq, act_quant=True)
             elif opt.quant_act:
                 # To be implement
                 logger.info("Doing online activation calibration")
-                qnn.set_quant_state(weight_quant=True, act_quant=True)
+                qnn.set_quant_state(weight_quant=not use_gptq, act_quant=True)
             # Currently, this does not work
             """
             print("Report delta change")

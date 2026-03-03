@@ -411,7 +411,14 @@ def gptq_quantize_model(
         gptq.free()
         torch.cuda.empty_cache()
     
-    # Re-enable weight quantization for inference
-    qnn.set_quant_state(True, False)
+    # After GPTQ: keep weight_quant=False.
+    # GPTQ already baked quantized-dequantized values into both weight.data
+    # and org_weight.data. If weight_quant=True, QuantModule.forward would
+    # re-quantize these values through the quantizer with different scales
+    # (per-channel instead of GPTQ's per-group), destroying the carefully
+    # optimized weights and producing black images.
+    # With weight_quant=False, QuantModule.forward uses org_weight directly,
+    # which already contains the GPTQ-quantized values.
+    qnn.set_quant_state(False, False)
     
     logger.info("GPTQ quantization complete for all layers")
