@@ -191,8 +191,7 @@ class GPTQ:
         # GPTQ manages column groups itself, so we must disable the quantizer's
         # internal group_quant reshape (it would double-reshape the data).
         # We also use 'max' for scale init since GPTQ handles error compensation.
-        orig_group_quant = weight_quantizer.group_quant
-        orig_scale_method = weight_quantizer.scale_method
+        # These settings are left permanently — see comment at end of quantize().
         weight_quantizer.group_quant = False
         weight_quantizer.scale_method = 'max'
         
@@ -261,9 +260,15 @@ class GPTQ:
         logger.info("GPTQ quantization loss for %s: %.6f",
                     getattr(self.layer, 'nametag', 'unknown'), avg_loss)
         
-        # Restore quantizer settings that GPTQ temporarily modified
-        weight_quantizer.group_quant = orig_group_quant
-        weight_quantizer.scale_method = orig_scale_method
+        # After GPTQ: leave group_quant=False and scale_method='max'.
+        # GPTQ already applied group quantization internally and baked the
+        # results into weight.data/org_weight.data. If we restore group_quant=True,
+        # the quantizer would reshape the weight differently than the delta was
+        # computed for (e.g. Conv2d (1152,4,2,2) → 144 groups vs 1152 channels).
+        # Reset inited so the quantizer re-initializes with the correct shape
+        # on the next forward pass. Re-quantizing already-quantized weights
+        # is a near-no-op anyway.
+        weight_quantizer.inited = False
         
         # Reshape back
         Q = Q.reshape(W_shape)
