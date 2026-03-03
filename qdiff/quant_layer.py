@@ -583,7 +583,7 @@ class QuantModule(nn.Module):
     def forward(self, input: torch.Tensor, split: int = 0):
         og_dtype = input.dtype
         # Log first-time quantizer initialization per layer
-        if self.use_weight_quant and not self.weight_quantizer.inited and self.run_prints:
+        if self.use_weight_quant and hasattr(self.weight_quantizer, 'inited') and not self.weight_quantizer.inited and self.run_prints:
             logger.info("  QuantModule init: %s | weight=%s | group_quant=%s | scale_method=%s",
                        getattr(self, 'nametag', '?'), 
                        list(self.weight.shape),
