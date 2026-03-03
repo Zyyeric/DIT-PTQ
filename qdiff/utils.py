@@ -605,9 +605,19 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
                         m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                     else:
                         m.zero_point = nn.Parameter(m.zero_point)
+                # Also register delta as Parameter to match checkpoint format
+                if m.delta is not None:
+                    if not torch.is_tensor(m.delta):
+                        m.delta = nn.Parameter(torch.tensor(float(m.delta)))
+                    elif not isinstance(m.delta, nn.Parameter):
+                        m.delta = nn.Parameter(m.delta)
                     
         ckpt = torch.load(ckpt_path, map_location='cpu')
-        qnn.load_state_dict(ckpt)
+        missing, unexpected = qnn.load_state_dict(ckpt, strict=False)
+        if missing:
+            logger.warning("resume_cali_model: %d missing keys (first 5: %s)", len(missing), missing[:5])
+        if unexpected:
+            logger.warning("resume_cali_model: %d unexpected keys (first 5: %s)", len(unexpected), unexpected[:5])
         qnn.set_quant_state(weight_quant=True, act_quant=True)
         
         for m in qnn.model.modules():
