@@ -106,11 +106,14 @@ def quantize_to_fp8_ste_MM(
     This allows to define FP8 quantization using STE rounding functions and thus learn the bias
 
     """
-    maxval = maxval.to(x_float.device)
+    # Compute in float32 to avoid CPU Half precision errors (clamp, log2, etc.)
+    orig_dtype = x_float.dtype
+    x_float = x_float.float()
+    maxval = maxval.to(x_float.device).float()
     # NOTE clip maxval to make sure it is larger than 0
     maxval = torch.clamp(maxval, min=1e-4)
 
-    num_mantissa_bits = num_mantissa_bits.to(x_float.device)
+    num_mantissa_bits = num_mantissa_bits.to(x_float.device).float()
     M = torch.clamp(round_ste_func(num_mantissa_bits), 0, n_bits - sign_bits)
     E = n_bits - sign_bits - M
 
@@ -144,7 +147,7 @@ def quantize_to_fp8_ste_MM(
             logger.info('Max value <= 0')
             print(maxval)
         exit()
-    return result
+    return result.to(orig_dtype)
 
 '''
 For FP8 adaround, add the soft target function values to the floor of (xc/scale)
