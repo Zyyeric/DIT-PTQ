@@ -158,6 +158,12 @@ class UniformAffineQuantizer(nn.Module):
                 # self.zero_point = torch.nn.Parameter(self.zero_point)
             else:
                 # NOTE FP quantization use different initialization function
+                # Clear any existing nn.Parameter registration (e.g. from checkpoint
+                # saving code) so we can assign plain tensors from init_quantization_scale
+                if isinstance(self.delta, nn.Parameter):
+                    del self.delta
+                if isinstance(self.zero_point, nn.Parameter):
+                    del self.zero_point
                 if self.fp:
                     self.delta, self.zero_point = self.init_quantization_scale_fp(x, self.channel_wise)
                 else:
