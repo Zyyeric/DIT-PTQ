@@ -437,20 +437,6 @@ def get_train_samples(args, sample_data, custom_steps=None):
 
 def get_train_samples_custom(args, sample_data, custom_steps=None):
     return get_train_samples_custom_ucs(args, sample_data, custom_steps)
-    num_samples, num_st = args.cali_n, args.cali_st
-
-    # get the real number of timesteps (especially for DDIM)
-    nsteps = len(sample_data["ts"])
-    assert(nsteps >= custom_steps)
-    timesteps = list(range(0, nsteps, nsteps//num_st))
-    logger.info(f'Selected {len(timesteps)} steps from {nsteps} sampling steps')
-    xs_lst = [sample_data["xs"][i][:num_samples] for i in timesteps]
-    ts_lst = [sample_data["ts"][i][:num_samples] for i in timesteps]
-    conds_lst = [sample_data["cs"][i][:num_samples] for i in timesteps]
-    xs = torch.cat(xs_lst, dim=0)
-    ts = torch.cat(ts_lst, dim=0)
-    conds = torch.cat(conds_lst, dim=0)
-    return xs, ts, conds
 
 def get_train_samples_custom_ucs(args, sample_data, custom_steps=None):
     num_samples, num_st = args.cali_n, args.cali_st

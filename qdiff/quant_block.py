@@ -449,10 +449,11 @@ class QuantHunyuanBlock(BaseQuantBlock):
             self.skip_linear = tran.skip_linear
             self.skip_norm = tran.skip_norm
             self.split = tran.skip_linear.weight.shape[1] // 2
-            if isinstance(self.skip_linear, QuantModule) or isinstance(self.skip_linear, QuantModuleMultiQ):
-                self.skip_q = True
-            else:
-                self.skip_q = False
+            try:
+                from qdiff.quant_model import QuantModuleMultiQ
+                self.skip_q = isinstance(self.skip_linear, (QuantModule, QuantModuleMultiQ))
+            except ImportError:
+                self.skip_q = isinstance(self.skip_linear, QuantModule)
 
         # Check that the Attention Processor is correct
         # NOTE We do not need to check attention processor for weight-only quantization

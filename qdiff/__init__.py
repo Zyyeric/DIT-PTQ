@@ -5,3 +5,4 @@ from qdiff.quant_layer import QuantModule
 from qdiff.quant_model import QuantModel
 from qdiff.quant_model import QuantModelSelect
 from qdiff.quant_model import QuantModelMultiQ
+from qdiff.gptq import gptq_quantize_model

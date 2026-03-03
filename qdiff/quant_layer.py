@@ -178,14 +178,15 @@ class UniformAffineQuantizer(nn.Module):
                 x_dequant = quantize_to_fp8_ste_MM(
                 x, self.n_bits, self.delta[self.dynamic_idx], self.dynamic_mantissa[self.dynamic_idx], self.sign_bits
                 )
+                # NOTE for group quantization
+                if self.group_quant == True:
+                    x_dequant = x_dequant.view(x_old.shape)
+                return x_dequant
 
             # NOTE Origin code for fp quantization
             x_dequant = quantize_to_fp8_ste_MM(
             x, self.n_bits, self.delta, self.mantissa_bits, self.sign_bits
             )
-            # NOTE for input/output channel
-            #if self.dim == 1:
-            #    x_dequant = torch.transpose(x_dequant, 0, 1)
 
             # NOTE for group quantization
             if self.group_quant == True:
@@ -573,7 +574,7 @@ class QuantModule(nn.Module):
             self.set_split()
 
         if self.run_prints and self.nametag is not None:
-            print("====" + self.nametag + "=====")
+            logger.debug("QuantModule forward: %s", self.nametag)
             self.run_prints = False
         if not self.disable_act_quant and self.use_act_quant:
             if self.split != 0:

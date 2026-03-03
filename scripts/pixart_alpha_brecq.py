@@ -20,13 +20,13 @@ from contextlib import nullcontext
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
-from qdiff import (
-    QuantModel, QuantModule, BaseQuantBlock, 
-    block_reconstruction, layer_reconstruction,
-)
+from qdiff import QuantModel, QuantModule, BaseQuantBlock
+from qdiff.block_recon import block_reconstruction
+from qdiff.layer_recon import layer_reconstruction
 from qdiff.adaptive_rounding import AdaRoundQuantizer
 from qdiff.quant_layer import UniformAffineQuantizer
-from qdiff.utils import resume_cali_model, get_train_samples_custom, convert_adaround, pixart_alpha_aca_dict
+from qdiff.utils import resume_cali_model, get_train_samples, get_train_samples_custom, pixart_alpha_aca_dict
+from qdiff.gptq import gptq_quantize_model
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers import DiTPipeline, DPMSolverMultistepScheduler
 from transformers import AutoFeatureExtractor
@@ -391,8 +391,8 @@ def main():
         help="independent quantization to groups of <size> consecutive weights",
     )
     parser.add_argument(
-    "--no_fp_biased_adaround", action="store_false",
-    help="Disable FP scale awared adaround"
+    "--disable_fp_biased_adaround", action="store_true",
+    help="Disable FP scale-aware adaround (only relevant in FP mode)"
     )
     parser.add_argument(
     "--disable_online_act_quant", action="store_true",
@@ -419,7 +419,19 @@ def main():
     )
     parser.add_argument(
     "--disable_group_quant", action="store_true",
-    help="Disable group weight quantization"
+    help="Disable group weight quantization (for INT mode, default is enabled)"
+    )
+    parser.add_argument(
+    "--int_quant_method", type=str, default="gptq", choices=["gptq", "adaround"],
+    help="Weight quantization method for INT mode: 'gptq' (Q-DiT-style) or 'adaround' (BRECQ-style)"
+    )
+    parser.add_argument(
+    "--gptq_blocksize", type=int, default=128,
+    help="GPTQ block size (columns processed together)"
+    )
+    parser.add_argument(
+    "--gptq_percdamp", type=float, default=0.01,
+    help="GPTQ dampening percentage for Hessian diagonal"
     )
     parser.add_argument(
         "--parallelism",
@@ -516,21 +528,57 @@ def main():
 
     assert(opt.cond)
     if opt.ptq:
-        wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse', 'fp': True, 
-                    'mantissa_bits': opt.weight_mantissa_bits,
-                    'attn_weight_mantissa': opt.attn_weight_mantissa,
-                    'ff_weight_mantissa': opt.ff_weight_mantissa,
-                    'weight_group_size': opt.weight_group_size,
-                    'fp_biased_adaround': opt.no_fp_biased_adaround,
-                    'fp': (not opt.disable_fp_quant),
-                    'group_quant': (not opt.disable_group_quant)
-                    }
-        aq_params = {'n_bits': opt.act_bit, 'channel_wise': False, 'scale_method': 'mse', 'leaf_param':  opt.quant_act, 
-                    'mantissa_bits': opt.act_mantissa_bits,
-                    'asym_softmax': opt.asym_softmax,
-                    'online_act_quant': (not opt.disable_online_act_quant),
-                    'fp': (not opt.disable_fp_quant)
-                    }
+        # Determine if we're in INT or FP mode
+        use_int_quant = opt.disable_fp_quant
+        use_gptq = use_int_quant and (opt.int_quant_method == 'gptq')
+        
+        if use_int_quant:
+            # INT4 quantization params (Q-DiT style)
+            # - Group quantization enabled by default
+            # - No FP-specific parameters
+            logger.info("INT quantization mode: %s", opt.int_quant_method)
+            wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse',
+                        'fp': False,
+                        'mantissa_bits': None,
+                        'weight_group_size': opt.weight_group_size,
+                        'fp_biased_adaround': False,
+                        'group_quant': (not opt.disable_group_quant),
+                        # Extra keys consumed by QuantModel (not UniformAffineQuantizer)
+                        'attn_weight_mantissa': None,
+                        'ff_weight_mantissa': None,
+                        }
+            aq_params = {'n_bits': opt.act_bit, 'channel_wise': False, 'scale_method': 'mse',
+                        'leaf_param': opt.quant_act,
+                        'mantissa_bits': None,
+                        'online_act_quant': (not opt.disable_online_act_quant),
+                        'fp': False,
+                        # Extra keys consumed by QuantModel
+                        'asym_softmax': opt.asym_softmax,
+                        }
+        else:
+            # FP4 quantization params (FP4DiT style)
+            # - Channel-wise quantization (no group quant)
+            # - FP-specific mantissa bits and scale-aware adaround
+            logger.info("FP quantization mode with BRECQ+AdaRound")
+            wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse',
+                        'fp': True,
+                        'mantissa_bits': opt.weight_mantissa_bits,
+                        'weight_group_size': opt.weight_group_size,
+                        'fp_biased_adaround': (not opt.disable_fp_biased_adaround),
+                        'group_quant': False,  # FP4DiT uses channel-wise, not group
+                        # Extra keys consumed by QuantModel
+                        'attn_weight_mantissa': opt.attn_weight_mantissa,
+                        'ff_weight_mantissa': opt.ff_weight_mantissa,
+                        }
+            aq_params = {'n_bits': opt.act_bit, 'channel_wise': False, 'scale_method': 'mse',
+                        'leaf_param': opt.quant_act,
+                        'mantissa_bits': opt.act_mantissa_bits,
+                        'online_act_quant': (not opt.disable_online_act_quant),
+                        'fp': True,
+                        # Extra keys consumed by QuantModel
+                        'asym_softmax': opt.asym_softmax,
+                        }
+
         if opt.resume:
             logger.info('Load with min-max quick initialization')
             wq_params['scale_method'] = 'max'
@@ -636,11 +684,25 @@ def main():
 
             if not opt.resume_w:
                 logger.info("Doing weight calibration")
-                recon_model(qnn)
+                if use_gptq:
+                    # INT4+GPTQ path: use GPTQ instead of BRECQ+AdaRound
+                    logger.info("Using GPTQ for INT weight quantization")
+                    group_size = opt.weight_group_size if not opt.disable_group_quant else -1
+                    gptq_quantize_model(
+                        qnn, cali_data,
+                        batch_size=opt.cali_batch_size,
+                        blocksize=opt.gptq_blocksize,
+                        percdamp=opt.gptq_percdamp,
+                        group_size=group_size,
+                        cond=opt.cond,
+                    )
+                else:
+                    # FP4+BRECQ-AdaRound path (or INT4+AdaRound fallback)
+                    recon_model(qnn)
                 qnn.set_quant_state(weight_quant=True, act_quant=False)
                 if use_ddp:
                     dist.barrier()
-                # NOTE Checkpoint weight quantization calibation separately
+                # Save checkpoint
                 logger.info("Saving calibrated quantized UNet model")
                 for m in qnn.model.modules():
                     if isinstance(m, AdaRoundQuantizer):

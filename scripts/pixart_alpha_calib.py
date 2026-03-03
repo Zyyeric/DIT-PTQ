@@ -13,9 +13,10 @@ from pytorch_lightning import seed_everything
 
 from qdiff import QuantModel
 
+import logging
+logger = logging.getLogger(__name__)
+
 # TODO pull actual images, and prompts, from COCO.
-# TODO change location
-image_sample = "/home/ruichen/data/coco/val2017/000000462614.jpg"
 
 timesteps = list(reversed(range(50)))
 
@@ -26,7 +27,7 @@ seed_everything(42)
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
-    pipeline = PixArtAlphaPipeline.from_pretrained("PixArt-alpha/PixArt-XL-2-512x512", torch_dtype=dtype)
+    pipeline = PixArtAlphaPipeline.from_pretrained("PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=dtype)
     if device.type == "cuda":
         try:
             pipeline.enable_model_cpu_offload()
@@ -129,7 +130,7 @@ if __name__ == "__main__":
                 #print("EHS:", encoder_hidden_states.shape)
                 #print(negative_prompt_embeds.shape)
                 #print(prompt_embeds.shape)
-                print(prompt_list)
+                logger.debug("Calibration prompts: %s", prompt_list)
                 #assert(negative_prompt_embeds.shape != prompt_embeds.shape)
 
                 #height = pipeline.default_sample_size * pipeline.vae_scale_factor
