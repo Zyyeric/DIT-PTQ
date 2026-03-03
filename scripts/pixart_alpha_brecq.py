@@ -658,12 +658,29 @@ def main():
             cali_cs = cali_cs.to(device)
             logger.info("Running initialization forward pass (2 samples)...")
             _t0 = _time.time()
+            
+            # For GPTQ path: use fast 'max' scale init instead of slow 'mse' grid search.
+            # With group_quant=True, MSE init creates thousands of groups per layer,
+            # each doing a 10-step grid search — this takes hours. GPTQ re-initializes
+            # all quantizers inside quantize() anyway, so we only need rough scales here.
+            if use_gptq:
+                for m in qnn.model.modules():
+                    if isinstance(m, QuantModule):
+                        m.weight_quantizer.scale_method = 'max'
+            
             _ = qnn(
                 cali_xs[:2],
                 timestep=cali_ts[:2],
                 encoder_hidden_states=cali_cs[:2],
                 added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[:2]),
             )
+            
+            # Restore 'mse' so GPTQ's own quantizer init uses the correct method
+            if use_gptq:
+                for m in qnn.model.modules():
+                    if isinstance(m, QuantModule):
+                        m.weight_quantizer.scale_method = 'mse'
+            
             logger.info("Initialization forward pass done in %.1fs", _time.time() - _t0)
 
             # TODO adjust some things here

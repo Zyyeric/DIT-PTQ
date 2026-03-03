@@ -214,6 +214,11 @@ class UniformAffineQuantizer(nn.Module):
         else:
             x_quant = torch.clamp(x_int, 0, self.n_levels - 1)
         x_dequant = (x_quant - self.zero_point) * self.delta
+
+        # Restore original shape for group quantization (e.g., Conv2d 4D weights)
+        if self.group_quant == True:
+            x_dequant = x_dequant.view(x_old.shape)
+
         return x_dequant
     
     # NOTE this function is what allows the scale and zero-point of activations to be updated as more data is added.
@@ -335,6 +340,11 @@ class UniformAffineQuantizer(nn.Module):
         if channel_wise:
             x_clone = x.clone().detach()
             n_channels = x_clone.shape[0]
+            if n_channels > 100:
+                logger.info("    init_quantization_scale: %d channels, scale_method=%s (this may take a while)",
+                           n_channels, self.scale_method)
+            import time as _time
+            _init_start = _time.time()
             if len(x.shape) == 4:
                 x_max = x_clone.abs().max(dim=-1)[0].max(dim=-1)[0].max(dim=-1)[0]
                 x_min = x_clone.abs().min(dim=-1)[0].min(dim=-1)[0].min(dim=-1)[0]
@@ -354,6 +364,12 @@ class UniformAffineQuantizer(nn.Module):
             # determine the scale and zero point channel-by-channel
             for c in range(n_channels):
                 delta[c], zero_point[c] = self.init_quantization_scale(x_clone[c], channel_wise=False)
+                # Progress logging for large channel counts
+                if n_channels > 500 and (c + 1) % 1000 == 0:
+                    elapsed = _time.time() - _init_start
+                    eta = elapsed / (c + 1) * (n_channels - c - 1)
+                    logger.info("    init_quantization_scale: channel %d/%d | elapsed=%.1fs | ETA=%.1fs",
+                               c + 1, n_channels, elapsed, eta)
             if len(x.shape) == 4:
                 delta = delta.view(-1, 1, 1, 1)
                 zero_point = zero_point.view(-1, 1, 1, 1)
@@ -566,6 +582,13 @@ class QuantModule(nn.Module):
 
     def forward(self, input: torch.Tensor, split: int = 0):
         og_dtype = input.dtype
+        # Log first-time quantizer initialization per layer
+        if self.use_weight_quant and not self.weight_quantizer.inited and self.run_prints:
+            logger.info("  QuantModule init: %s | weight=%s | group_quant=%s | scale_method=%s",
+                       getattr(self, 'nametag', '?'), 
+                       list(self.weight.shape),
+                       self.weight_quantizer.group_quant,
+                       self.weight_quantizer.scale_method)
         if split != 0 and self.split != 0:
             assert(split == self.split)
         elif split != 0:
