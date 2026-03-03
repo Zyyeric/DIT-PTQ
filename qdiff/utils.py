@@ -606,11 +606,23 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
                     else:
                         m.zero_point = nn.Parameter(m.zero_point)
                 # Also register delta as Parameter to match checkpoint format
-                if m.delta is not None:
+                # Act quantizers may have delta/zero_point = None if act_quant
+                # was disabled during init forward pass. Create dummy Parameters
+                # so load_state_dict can populate them from the checkpoint.
+                if m.delta is None:
+                    m.delta = nn.Parameter(torch.tensor(1.0))
+                elif not isinstance(m.delta, nn.Parameter):
                     if not torch.is_tensor(m.delta):
                         m.delta = nn.Parameter(torch.tensor(float(m.delta)))
-                    elif not isinstance(m.delta, nn.Parameter):
+                    else:
                         m.delta = nn.Parameter(m.delta)
+                if m.zero_point is None:
+                    m.zero_point = nn.Parameter(torch.tensor(0.0))
+                elif not isinstance(m.zero_point, nn.Parameter):
+                    if not torch.is_tensor(m.zero_point):
+                        m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
+                    else:
+                        m.zero_point = nn.Parameter(m.zero_point)
                     
         ckpt = torch.load(ckpt_path, map_location='cpu')
         missing, unexpected = qnn.load_state_dict(ckpt, strict=False)

@@ -829,8 +829,8 @@ def main():
         qnn = qnn.to(device=device, dtype=torch.float16)
         model.transformer = qnn
         # The pipeline's _execution_device property may fail after replacing
-        # the transformer with QuantModel. Set it explicitly.
-        model._execution_device = device
+        # the transformer with QuantModel. Monkey-patch it to return our device.
+        type(model)._execution_device = property(lambda self: device)
     
     #model.text_encoder = model.text_encoder.to("cuda")
 
