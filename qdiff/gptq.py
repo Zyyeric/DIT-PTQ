@@ -82,6 +82,8 @@ class GPTQ:
         self.H = self.H.to(inp.device)
         self.H += inp.t() @ inp
         self.nsamples += n
+        if self.nsamples % 100 < n:
+            logger.debug("  Hessian accumulation: %d samples collected so far", self.nsamples)
 
     def _quantize_column(self, w_col: torch.Tensor, weight_quantizer: UniformAffineQuantizer):
         """
@@ -178,9 +180,16 @@ class GPTQ:
         weight_quantizer.inited = torch.tensor(True)
         
         # Process columns in blocks
-        for i1 in range(0, self.columns, blocksize):
+        num_blocks = (self.columns + blocksize - 1) // blocksize
+        import time as _time
+        _quant_start = _time.time()
+        for block_idx, i1 in enumerate(range(0, self.columns, blocksize)):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
+            if block_idx % max(num_blocks // 5, 1) == 0:
+                elapsed = _time.time() - _quant_start
+                logger.info("  GPTQ block %d/%d (cols %d-%d/%d) | elapsed=%.1fs",
+                           block_idx + 1, num_blocks, i1, i2, self.columns, elapsed)
             
             W1 = W[:, i1:i2].clone()
             Q1 = torch.zeros_like(W1)
@@ -322,7 +331,10 @@ def gptq_quantize_model(
         num_batches = math.ceil(cali_xs.shape[0] / batch_size)
         
         with torch.no_grad():
-            for i in range(min(num_batches, 16)):  # Cap at 16 batches for speed
+            n_fwd_batches = min(num_batches, 16)
+            logger.info("GPTQ: Running %d calibration batches (batch_size=%d) for Hessian",
+                       n_fwd_batches, batch_size)
+            for i in range(n_fwd_batches):  # Cap at 16 batches for speed
                 start = i * batch_size
                 end = min((i + 1) * batch_size, cali_xs.shape[0])
                 x_batch = cali_xs[start:end].to(device, torch.float16)
@@ -341,6 +353,7 @@ def gptq_quantize_model(
                     break
         
         handle.remove()
+        logger.info("GPTQ: Hessian collection done for %s: %d samples collected", layer_name, gptq.nsamples)
         
         # Run GPTQ quantization
         if gptq.nsamples > 0:

@@ -67,6 +67,7 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
     cached_batches = []
     cached_inps, cached_outs = None, None
     torch.cuda.empty_cache()
+    logger.info("  Collecting inp/out data: batch_size=%d, act_quant=%s", batch_size, act_quant)
 
     if not cond:
         cali_xs, cali_ts = cali_data

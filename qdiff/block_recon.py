@@ -128,6 +128,8 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
 
     loss_func = LossFunction(block, round_loss=loss_mode, weight=weight, max_count=iters, rec_loss=rec_loss,
                              b_range=b_range, decay_start=0, warmup=warmup, p=p)
+    import time as _time
+    _recon_start = _time.time()
 
     # Save data before optimizing the rounding
     # cached_inps, cached_outs = save_inp_oup_data(
@@ -185,6 +187,13 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
             optimizer.step()
             if scheduler:
                 scheduler.step()
+            # Progress logging
+            log_interval = max(iters // 10, 500)
+            if (i + 1) % log_interval == 0 or i == 0:
+                elapsed = _time.time() - _recon_start
+                eta = elapsed / (i + 1) * (iters - i - 1) if i > 0 else 0
+                logger.info(f"  Block recon iter {i+1}/{iters} | loss={err.item():.6f} | "
+                           f"elapsed={elapsed:.1f}s | ETA={eta:.1f}s")
 
     block = block.to(device, torch.float16)
     torch.cuda.empty_cache()

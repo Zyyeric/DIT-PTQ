@@ -489,11 +489,19 @@ def main():
     if use_ddp and opt.parallel_generate and opt.prompt is not None and is_main_process:
         logger.info("--parallel_generate is ignored when --prompt is provided (single prompt path).")
 
+    import time as _time
+    _pipeline_start = _time.time()
+    logger.info("="*60)
+    logger.info("PIPELINE START")
+    logger.info("="*60)
 
     from diffusers import PixArtAlphaPipeline
+    logger.info("Loading PixArt-alpha model (this may take a few minutes)...")
+    _t0 = _time.time()
     model = PixArtAlphaPipeline.from_pretrained(
         "PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=torch.float16
     ).to(device)
+    logger.info("Model loaded in %.1fs", _time.time() - _t0)
 
     from qdiff.caption_util import get_captions
     pes, pams, npe, npam = None, None, None, None
@@ -536,7 +544,10 @@ def main():
             # INT4 quantization params (Q-DiT style)
             # - Group quantization enabled by default
             # - No FP-specific parameters
-            logger.info("INT quantization mode: %s", opt.int_quant_method)
+            logger.info("="*60)
+            logger.info("MODE: INT%d quantization | method=%s | group_quant=%s",
+                       opt.weight_bit, opt.int_quant_method, not opt.disable_group_quant)
+            logger.info("="*60)
             wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse',
                         'fp': False,
                         'mantissa_bits': None,
@@ -559,7 +570,10 @@ def main():
             # FP4 quantization params (FP4DiT style)
             # - Channel-wise quantization (no group quant)
             # - FP-specific mantissa bits and scale-aware adaround
-            logger.info("FP quantization mode with BRECQ+AdaRound")
+            logger.info("="*60)
+            logger.info("MODE: FP%d quantization | BRECQ+AdaRound | mantissa_w=%s mantissa_a=%s",
+                       opt.weight_bit, opt.weight_mantissa_bits, opt.act_mantissa_bits)
+            logger.info("="*60)
             wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse',
                         'fp': True,
                         'mantissa_bits': opt.weight_mantissa_bits,
@@ -585,9 +599,12 @@ def main():
             aq_params['scale_method'] = 'max'
         if opt.resume_w:
             wq_params['scale_method'] = 'max'
+        logger.info("Building QuantModel...")
+        _t0 = _time.time()
         qnn = QuantModel(
             model=model.transformer, weight_quant_params=wq_params, act_quant_params=aq_params,
             act_quant_mode="qdiff", sm_abit=opt.sm_abit)
+        logger.info("QuantModel built in %.1fs", _time.time() - _t0)
         #exit(0)
         qnn.to(device)
         qnn.eval()
@@ -602,12 +619,15 @@ def main():
             #class_labels = torch.tensor(list(range(1))) #.cuda()
             #cali_data = (noisy_latents, timesteps, class_labels)
             sample_data = torch.load(opt.cali_data_path)
+            logger.info("Loaded calibration data from %s", opt.cali_data_path)
             cali_data = get_train_samples_custom(opt, sample_data, opt.ddim_steps)
+            logger.info("Resuming calibrated model from %s", opt.cali_ckpt)
             resume_cali_model(qnn, opt.cali_ckpt, cali_data, opt.quant_act, "qdiff", cond=opt.cond)
         else:
-            logger.info(f"Sampling data from {opt.cali_st} timesteps for calibration")
-            
+            logger.info("Loading calibration data from %s ...", opt.cali_data_path)
+            _t0 = _time.time()
             sample_data = torch.load(opt.cali_data_path)  # This is de-commented when needed
+            logger.info("Calibration data loaded in %.1fs", _time.time() - _t0)
         
             # [step, batch_size * 2, in_channel, height, width] of the noise latent image
             #noisy_latents = torch.randn(opt.ddim_steps, 32, 4, 64, 64, dtype=torch.float16) #.cuda()
@@ -636,13 +656,15 @@ def main():
             cali_xs = cali_xs.to(device)
             cali_ts = cali_ts.to(device)
             cali_cs = cali_cs.to(device)
+            logger.info("Running initialization forward pass (2 samples)...")
+            _t0 = _time.time()
             _ = qnn(
                 cali_xs[:2],
                 timestep=cali_ts[:2],
                 encoder_hidden_states=cali_cs[:2],
                 added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[:2]),
             )
-            logger.info("Initializing has done!")
+            logger.info("Initialization forward pass done in %.1fs", _time.time() - _t0)
 
             # TODO adjust some things here
             kwargs = dict(cali_data=cali_data, batch_size=opt.cali_batch_size, 
@@ -683,11 +705,16 @@ def main():
                         recon_model(module)
 
             if not opt.resume_w:
-                logger.info("Doing weight calibration")
+                logger.info("="*60)
+                logger.info("PHASE: Weight Calibration")
+                logger.info("="*60)
+                _t0 = _time.time()
                 if use_gptq:
                     # INT4+GPTQ path: use GPTQ instead of BRECQ+AdaRound
                     logger.info("Using GPTQ for INT weight quantization")
                     group_size = opt.weight_group_size if not opt.disable_group_quant else -1
+                    logger.info("GPTQ params: blocksize=%d, percdamp=%.4f, group_size=%d",
+                               opt.gptq_blocksize, opt.gptq_percdamp, group_size)
                     gptq_quantize_model(
                         qnn, cali_data,
                         batch_size=opt.cali_batch_size,
@@ -698,7 +725,9 @@ def main():
                     )
                 else:
                     # FP4+BRECQ-AdaRound path (or INT4+AdaRound fallback)
+                    logger.info("Using BRECQ+AdaRound for weight calibration (iters=%d)", opt.cali_iters)
                     recon_model(qnn)
+                logger.info("Weight calibration completed in %.1fs", _time.time() - _t0)
                 qnn.set_quant_state(weight_quant=True, act_quant=False)
                 if use_ddp:
                     dist.barrier()
@@ -718,7 +747,10 @@ def main():
                     torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt_wq.pth"))
                 logger.info(model.transformer)
             if opt.quant_act and opt.disable_online_act_quant:
-                logger.info("UNet model")
+                logger.info("="*60)
+                logger.info("PHASE: Activation Calibration")
+                logger.info("="*60)
+                _t0 = _time.time()
                 logger.info(model.transformer)                    
                 logger.info("Doing activation calibration")
                 # Initialize activation quantization parameters
@@ -866,6 +898,12 @@ def main():
 
         logging.info(f"Your samples are ready and waiting for you here: \n{outpath} \n"
               f" \nEnjoy.")
+
+    logger.info("="*60)
+    logger.info("PIPELINE COMPLETE | Total elapsed: %.1fs (%.1f min)",
+               _time.time() - _pipeline_start,
+               (_time.time() - _pipeline_start) / 60)
+    logger.info("="*60)
 
     finalize_parallel(use_ddp)
 
