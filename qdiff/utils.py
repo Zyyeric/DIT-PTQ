@@ -594,37 +594,41 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
             with torch.no_grad():
                 _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
         print("Loading quantized model checkpoint again")
-        
-        for m in qnn.model.modules():
-            if isinstance(m, AdaRoundQuantizer):
-                m.zero_point = nn.Parameter(m.zero_point)
-                m.delta = nn.Parameter(m.delta)
-            elif isinstance(m, UniformAffineQuantizer):
-                if m.zero_point is not None:
-                    if not torch.is_tensor(m.zero_point):
-                        m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
-                    else:
-                        m.zero_point = nn.Parameter(m.zero_point)
-                # Also register delta as Parameter to match checkpoint format
-                # Act quantizers may have delta/zero_point = None if act_quant
-                # was disabled during init forward pass. Create dummy Parameters
-                # so load_state_dict can populate them from the checkpoint.
-                if m.delta is None:
-                    m.delta = nn.Parameter(torch.tensor(1.0))
-                elif not isinstance(m.delta, nn.Parameter):
-                    if not torch.is_tensor(m.delta):
-                        m.delta = nn.Parameter(torch.tensor(float(m.delta)))
-                    else:
-                        m.delta = nn.Parameter(m.delta)
-                if m.zero_point is None:
-                    m.zero_point = nn.Parameter(torch.tensor(0.0))
-                elif not isinstance(m.zero_point, nn.Parameter):
-                    if not torch.is_tensor(m.zero_point):
-                        m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
-                    else:
-                        m.zero_point = nn.Parameter(m.zero_point)
-                    
+
         ckpt = torch.load(ckpt_path, map_location='cpu')
+        
+        # Pre-register nn.Parameters for all delta/zero_point keys in the
+        # checkpoint. The checkpoint saves these as Parameters but the fresh
+        # model may have them as None (uninitialised act quantizers) or plain
+        # tensors. Walk the checkpoint keys and ensure the model has matching
+        # registered Parameters.
+        for key in ckpt.keys():
+            if not (key.endswith('.delta') or key.endswith('.zero_point')):
+                continue
+            # Navigate to the parent module
+            parts = key.split('.')
+            attr_name = parts[-1]  # 'delta' or 'zero_point'
+            module_path = parts[:-1]
+            try:
+                parent = qnn
+                for part in module_path:
+                    parent = getattr(parent, part)
+                # Check if the attribute exists and is already a Parameter
+                current = getattr(parent, attr_name, None)
+                if current is None or not isinstance(current, nn.Parameter):
+                    # Delete existing plain attribute if any, then register Parameter
+                    if current is not None and isinstance(current, nn.Parameter):
+                        pass  # already a Parameter
+                    else:
+                        if hasattr(parent, attr_name) and isinstance(current, nn.Parameter):
+                            pass
+                        elif hasattr(parent, attr_name):
+                            delattr(parent, attr_name)
+                        # Register a dummy Parameter that will be overwritten by load_state_dict
+                        setattr(parent, attr_name, nn.Parameter(ckpt[key].clone()))
+            except (AttributeError, KeyError):
+                pass  # Module path doesn't exist in fresh model, skip
+        
         missing, unexpected = qnn.load_state_dict(ckpt, strict=False)
         if missing:
             logger.warning("resume_cali_model: %d missing keys (first 5: %s)", len(missing), missing[:5])
