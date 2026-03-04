@@ -406,84 +406,101 @@ def main():
 
             if opt.resume_w:
                 log(f"  Resuming weights from: {opt.cali_ckpt}")
-                resume_cali_model(qnn, opt.cali_ckpt, cali_data, False, cond=opt.cond)
+                if opt.gptq:
+                    # GPTQ checkpoints contain only model weights (already
+                    # quantized in-place by fasterquant). They do NOT contain
+                    # AdaRound quantizer params (alpha/zero_point/delta).
+                    # Load directly with strict=False — no AdaRound conversion.
+                    log("  GPTQ resume: loading checkpoint directly (no AdaRound)")
+                    ckpt = torch.load(opt.cali_ckpt, map_location='cpu')
+                    missing, unexpected = qnn.load_state_dict(ckpt, strict=False)
+                    log(f"    Loaded: {len(ckpt)} keys  "
+                        f"missing={len(missing)}  unexpected={len(unexpected)}")
+                    if missing:
+                        log(f"    Missing (first 5): {missing[:5]}")
+                    if unexpected:
+                        log(f"    Unexpected (first 5): {unexpected[:5]}")
+                    del ckpt
+                    # Sync org_weight with loaded weights for QuantModules
+                    for m in qnn.modules():
+                        if isinstance(m, QuantModule) and hasattr(m, 'org_weight'):
+                            m.org_weight = m.weight.data.clone()
+                    log("  GPTQ resume complete — weights loaded")
+                else:
+                    resume_cali_model(qnn, opt.cali_ckpt, cali_data, False, cond=opt.cond)
+                log("  resume_w: skipping init forward pass and calibration")
             else:
                 log("  Initializing weight quantization parameters...")
 
-            # ── Cali data stays on CPU throughout ─────────────────────────────
-            # cali_xs alone is ~10.5 GB and cali_cs ~5 GB. Moving them to GPU
-            # all at once causes a silent CUDA OOM deadlock. We keep everything
-            # on CPU and .to(device) only the small slices we need per operation.
-            xs_gb = cali_xs.element_size() * cali_xs.numel() / 1024**3
-            cs_gb = cali_cs.element_size() * cali_cs.numel() / 1024**3
-            log(f"  Cali data staying on CPU:")
-            log(f"    cali_xs: {tuple(cali_xs.shape)}  {xs_gb:.2f} GB")
-            log(f"    cali_cs: {tuple(cali_cs.shape)}  {cs_gb:.2f} GB")
-            log(f"    total: {xs_gb + cs_gb:.2f} GB  — NOT moving to GPU")
-            log_gpu("before init forward pass")
+                # ── Cali data stays on CPU throughout ─────────────────────────
+                # cali_xs alone is ~10.5 GB and cali_cs ~5 GB. Moving them to GPU
+                # all at once causes a silent CUDA OOM deadlock. We keep everything
+                # on CPU and .to(device) only the small slices we need per operation.
+                xs_gb = cali_xs.element_size() * cali_xs.numel() / 1024**3
+                cs_gb = cali_cs.element_size() * cali_cs.numel() / 1024**3
+                log(f"  Cali data staying on CPU:")
+                log(f"    cali_xs: {tuple(cali_xs.shape)}  {xs_gb:.2f} GB")
+                log(f"    cali_cs: {tuple(cali_cs.shape)}  {cs_gb:.2f} GB")
+                log(f"    total: {xs_gb + cs_gb:.2f} GB  — NOT moving to GPU")
+                log_gpu("before init forward pass")
 
-            # Weight quant init forward pass — only 2 samples needed to
-            # initialize UAQ delta/zero_point for every QuantModule.
-            #
-            # IMPORTANT: temporarily override scale_method to 'max' for this
-            # init pass. The configured method (e.g. 'mse') runs a 100-point
-            # grid search per layer group during the first forward pass, which
-            # for 287 layers × (weight_cols / group_size) groups can take
-            # 10-30 minutes and appears as a hang. 'max' is O(1) and just
-            # needs to create correctly-shaped delta/zero_point tensors.
-            # The actual MSE-optimal scales are found during BRECQ/GPTQ anyway.
-            # ── Temporarily override scale_method='max' for init pass ──────
-            # 'mse' runs a 100-point grid search per group during the first
-            # forward pass (287 layers × cols/128 groups = thousands of searches
-            # on CPU). 'max' is O(1) and just creates correctly-shaped tensors.
-            # MSE-optimal scales are recomputed properly during GPTQ/BRECQ.
-            n_overridden = 0
-            for m in qnn.modules():
-                if hasattr(m, 'weight_quantizer') and hasattr(m.weight_quantizer, 'scale_method'):
-                    m.weight_quantizer.scale_method = 'max'
-                    n_overridden += 1
-            log(f"  Overrode scale_method → 'max' on {n_overridden} weight quantizers")
-            log(f"  (will restore to '{opt.weight_quant_method}' after init pass)")
+                # Weight quant init forward pass — only 2 samples needed to
+                # initialize UAQ delta/zero_point for every QuantModule.
+                #
+                # IMPORTANT: temporarily override scale_method to 'max' for this
+                # init pass. The configured method (e.g. 'mse') runs a 100-point
+                # grid search per layer group during the first forward pass, which
+                # for 287 layers × (weight_cols / group_size) groups can take
+                # 10-30 minutes and appears as a hang. 'max' is O(1) and just
+                # needs to create correctly-shaped delta/zero_point tensors.
+                # The actual MSE-optimal scales are found during BRECQ/GPTQ anyway.
+                n_overridden = 0
+                for m in qnn.modules():
+                    if hasattr(m, 'weight_quantizer') and hasattr(m.weight_quantizer, 'scale_method'):
+                        m.weight_quantizer.scale_method = 'max'
+                        n_overridden += 1
+                log(f"  Overrode scale_method → 'max' on {n_overridden} weight quantizers")
+                log(f"  (will restore to '{opt.weight_quant_method}' after init pass)")
 
-            qnn.set_quant_state(weight_quant=True, act_quant=False)
-            log(f"  Moving 2 samples to {device} and running forward pass...")
-            t_init = time.time()
-            with torch.no_grad():
-                _xs2 = cali_xs[:2].to(device)
-                _ts2 = cali_ts[:2].to(device)
-                _cs2 = cali_cs[:2].to(device)
-                log(f"    xs2={tuple(_xs2.shape)} dtype={_xs2.dtype}  "
-                    f"ts2={tuple(_ts2.shape)}  cs2={tuple(_cs2.shape)}")
-                _ = qnn(
-                    _xs2,
-                    timestep=_ts2,
-                    encoder_hidden_states=_cs2,
-                    added_cond_kwargs=pixart_alpha_aca_dict(_xs2),
+                qnn.set_quant_state(weight_quant=True, act_quant=False)
+                log(f"  Moving 2 samples to {device} and running forward pass...")
+                t_init = time.time()
+                with torch.no_grad():
+                    _xs2 = cali_xs[:2].to(device)
+                    _ts2 = cali_ts[:2].to(device)
+                    _cs2 = cali_cs[:2].to(device)
+                    log(f"    xs2={tuple(_xs2.shape)} dtype={_xs2.dtype}  "
+                        f"ts2={tuple(_ts2.shape)}  cs2={tuple(_cs2.shape)}")
+                    _ = qnn(
+                        _xs2,
+                        timestep=_ts2,
+                        encoder_hidden_states=_cs2,
+                        added_cond_kwargs=pixart_alpha_aca_dict(_xs2),
+                    )
+                    del _xs2, _ts2, _cs2
+                torch.cuda.empty_cache()
+                log(f"  Init forward pass done in {elapsed(t_init)}")
+                log_gpu("after init forward pass")
+
+                # Count how many quantizers were actually initialized
+                n_inited = sum(
+                    1 for m in qnn.modules()
+                    if hasattr(m, 'weight_quantizer')
+                    and hasattr(m.weight_quantizer, 'inited')
+                    and m.weight_quantizer.inited
                 )
-                del _xs2, _ts2, _cs2
-            torch.cuda.empty_cache()
-            log(f"  Init forward pass done in {elapsed(t_init)}")
-            log_gpu("after init forward pass")
+                log(f"  Weight quantizers initialized: {n_inited}/{n_overridden}")
 
-            # Count how many quantizers were actually initialized
-            n_inited = sum(
-                1 for m in qnn.modules()
-                if hasattr(m, 'weight_quantizer')
-                and hasattr(m.weight_quantizer, 'inited')
-                and m.weight_quantizer.inited
-            )
-            log(f"  Weight quantizers initialized: {n_inited}/{n_overridden}")
-
-            # ── Restore configured scale_method for BRECQ/GPTQ ───────────────
-            real_scale_method = opt.weight_quant_method
-            n_restored = 0
-            for m in qnn.modules():
-                if hasattr(m, 'weight_quantizer') and hasattr(m.weight_quantizer, 'scale_method'):
-                    m.weight_quantizer.scale_method = real_scale_method
-                    m.weight_quantizer.inited = False  # force re-init with correct method
-                    n_restored += 1
-            log(f"  Restored scale_method → '{real_scale_method}' on {n_restored} quantizers")
-            log(f"  inited=False reset so GPTQ/BRECQ will recompute with '{real_scale_method}'")
+                # ── Restore configured scale_method for BRECQ/GPTQ ───────────
+                real_scale_method = opt.weight_quant_method
+                n_restored = 0
+                for m in qnn.modules():
+                    if hasattr(m, 'weight_quantizer') and hasattr(m.weight_quantizer, 'scale_method'):
+                        m.weight_quantizer.scale_method = real_scale_method
+                        m.weight_quantizer.inited = False  # force re-init with correct method
+                        n_restored += 1
+                log(f"  Restored scale_method → '{real_scale_method}' on {n_restored} quantizers")
+                log(f"  inited=False reset so GPTQ/BRECQ will recompute with '{real_scale_method}'")
 
             kwargs = dict(
                 cali_data=cali_data, batch_size=opt.cali_batch_size,
@@ -515,7 +532,7 @@ def main():
                         recon_model(module, depth + 1)
 
             # ── 3b. GPTQ ──────────────────────────────────────────────────────
-            if opt.gptq:
+            if opt.gptq and not opt.resume_w:
                 from qdiff.gptq import GPTQ
                 log("")
                 log("─" * 60)
@@ -767,7 +784,22 @@ def main():
                         else:
                             m.zero_point = nn.Parameter(m.zero_point)
 
+        # After GPTQ, weights are already quantized in-place — disable the
+        # weight quantizer to avoid double-quantization and shape mismatches.
+        if opt.gptq:
+            log("  GPTQ path: disabling weight quantizer for inference "
+                "(weights already quantized in-place)")
+            qnn.set_quant_state(weight_quant=False, act_quant=opt.quant_act)
+
         qnn = qnn.to(device=device, dtype=torch.float16)
+        # org_weight / org_bias are plain tensor attrs (not Parameters/buffers)
+        # so .to() doesn't move them. Move them explicitly.
+        for m in qnn.modules():
+            if isinstance(m, QuantModule):
+                if hasattr(m, 'org_weight') and m.org_weight is not None:
+                    m.org_weight = m.org_weight.to(device=device, dtype=torch.float16)
+                if hasattr(m, 'org_bias') and m.org_bias is not None:
+                    m.org_bias = m.org_bias.to(device=device, dtype=torch.float16)
         model.transformer = qnn
         log(f"  Quantized transformer attached to pipeline in {elapsed(t0)}")
         log_gpu("after full PTQ")
@@ -777,6 +809,14 @@ def main():
     log("─" * 60)
     log("STEP 4  Sampling images...")
     t_sample = time.time()
+
+    # Older diffusers versions have a broken _execution_device property that
+    # raises AttributeError. Override it on the class with a working version.
+    try:
+        _ = model._execution_device
+    except AttributeError:
+        type(model)._execution_device = property(lambda self: device)
+        log(f"  Patched _execution_device → {device}")
 
     sample_path = os.path.join(outpath, sp)
     os.makedirs(sample_path, exist_ok=True)
