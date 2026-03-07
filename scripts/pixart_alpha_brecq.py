@@ -618,7 +618,8 @@ def main():
                     # GPTQ is not sensitive to sample count past ~128-256.
                     # Using the full cali set (e.g. 5120) makes collection
                     # 20-40x slower with negligible accuracy improvement.
-                    n_total = min(cali_xs.size(0), opt.gptq_cali_n)
+                    # n_total = min(cali_xs.size(0), opt.gptq_cali_n)
+                    n_total = cali_xs.size(0)
                     bs = opt.cali_batch_size
                     n_passes = (n_total + bs - 1) // bs
                     log(f"    Collecting Hessians: {n_total}/{cali_xs.size(0)} samples  "
