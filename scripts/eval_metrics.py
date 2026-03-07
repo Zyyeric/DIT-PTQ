@@ -1,6 +1,9 @@
 import argparse
 import json
 import math
+import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import List, Tuple
 
@@ -35,6 +38,15 @@ def list_images(root: str) -> List[Path]:
     return files
 
 
+def materialize_image_subset(paths: List[Path], target_dir: str) -> None:
+    for idx, path in enumerate(paths):
+        dst = Path(target_dir) / f"{idx:06d}{path.suffix.lower()}"
+        try:
+            os.symlink(path.resolve(), dst)
+        except OSError:
+            shutil.copy2(path, dst)
+
+
 class ImageDataset(Dataset):
     def __init__(self, paths: List[Path]):
         self.paths = paths
@@ -47,6 +59,7 @@ class ImageDataset(Dataset):
         with Image.open(path) as img:
             img = img.convert("RGB")
             arr = TF.pil_to_tensor(img).float() / 255.0
+            arr = TF.resize(arr, [299, 299], antialias=True)
         return arr, path.name
 
 
@@ -58,7 +71,7 @@ def collate(batch):
 
 def get_inception_extractor(device: torch.device):
     weights = Inception_V3_Weights.IMAGENET1K_V1
-    model = inception_v3(weights=weights, aux_logits=False, transform_input=False).to(device).eval()
+    model = inception_v3(weights=weights).to(device).eval()
     extractor = create_feature_extractor(
         model, return_nodes={"avgpool": "pool", "Mixed_6e": "mixed6e"}
     ).to(device).eval()
@@ -112,7 +125,7 @@ def running_stats_from_paths(
             feats = extractor(imgs)
 
             pool = feats["pool"].flatten(1).float().cpu().numpy()  # [B, 2048]
-            spatial = feats["mixed6e"].permute(0, 2, 3, 1).reshape(-1, feats["mixed6e"].shape[1]).float().cpu().numpy()
+            spatial = feats["mixed6e"].reshape(feats["mixed6e"].shape[0], -1).float().cpu().numpy()
 
             if sum_pool is None:
                 d_pool = pool.shape[1]
@@ -214,6 +227,23 @@ def compute_clip_score(
     return mean_cos, clip_score
 
 
+def compute_clean_fid_from_paths(gen_images: List[Path], real_images: List[Path], mode: str) -> float:
+    try:
+        from cleanfid import fid
+    except ImportError as exc:
+        raise RuntimeError(
+            "clean-fid is not installed. Install it with `pip install clean-fid` "
+            "or switch to `--fid_backend custom`."
+        ) from exc
+
+    with tempfile.TemporaryDirectory(prefix="cleanfid_gen_") as gen_tmp, tempfile.TemporaryDirectory(
+        prefix="cleanfid_real_"
+    ) as real_tmp:
+        materialize_image_subset(gen_images, gen_tmp)
+        materialize_image_subset(real_images, real_tmp)
+        return float(fid.compute_fid(gen_tmp, real_tmp, mode=mode))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate generated images with FID, sFID, and CLIP-score.")
     parser.add_argument("--gen_dir", type=str, required=True, help="Directory containing generated images.")
@@ -234,6 +264,20 @@ def main():
     parser.add_argument("--max_gen_images", type=int, default=None)
     parser.add_argument("--max_real_images", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--fid_backend",
+        type=str,
+        default="clean-fid",
+        choices=["clean-fid", "custom"],
+        help="FID implementation. `clean-fid` is the default and recommended setting.",
+    )
+    parser.add_argument(
+        "--clean_fid_mode",
+        type=str,
+        default="clean",
+        choices=["clean", "legacy", "clip"],
+        help="clean-fid preprocessing mode when `--fid_backend clean-fid` is used.",
+    )
     parser.add_argument("--save_json", type=str, default=None, help="Optional output json path.")
     args = parser.parse_args()
 
@@ -249,16 +293,28 @@ def main():
     if len(gen_images) < 2 or len(real_images) < 2:
         raise RuntimeError("Need at least 2 generated and 2 real images to compute FID/sFID.")
 
-    extractor, mean, std = get_inception_extractor(device)
-    mu_g, cov_g, mu_gs, cov_gs, n_g, ns_g = running_stats_from_paths(
-        gen_images, extractor, mean, std, device, args.batch_size, args.num_workers
-    )
-    mu_r, cov_r, mu_rs, cov_rs, n_r, ns_r = running_stats_from_paths(
-        real_images, extractor, mean, std, device, args.batch_size, args.num_workers
-    )
-
-    fid = frechet_distance(mu_g, cov_g, mu_r, cov_r)
-    sfid = frechet_distance(mu_gs, cov_gs, mu_rs, cov_rs)
+    if args.fid_backend == "clean-fid":
+        fid = compute_clean_fid_from_paths(gen_images, real_images, mode=args.clean_fid_mode)
+        n_g = len(gen_images)
+        n_r = len(real_images)
+        extractor, mean, std = get_inception_extractor(device)
+        _, _, mu_gs, cov_gs, _, ns_g = running_stats_from_paths(
+            gen_images, extractor, mean, std, device, args.batch_size, args.num_workers
+        )
+        _, _, mu_rs, cov_rs, _, ns_r = running_stats_from_paths(
+            real_images, extractor, mean, std, device, args.batch_size, args.num_workers
+        )
+        sfid = frechet_distance(mu_gs, cov_gs, mu_rs, cov_rs)
+    else:
+        extractor, mean, std = get_inception_extractor(device)
+        mu_g, cov_g, mu_gs, cov_gs, n_g, ns_g = running_stats_from_paths(
+            gen_images, extractor, mean, std, device, args.batch_size, args.num_workers
+        )
+        mu_r, cov_r, mu_rs, cov_rs, n_r, ns_r = running_stats_from_paths(
+            real_images, extractor, mean, std, device, args.batch_size, args.num_workers
+        )
+        fid = frechet_distance(mu_g, cov_g, mu_r, cov_r)
+        sfid = frechet_distance(mu_gs, cov_gs, mu_rs, cov_rs)
 
     prompts = load_prompts(
         num_images=len(gen_images),
@@ -274,9 +330,10 @@ def main():
     result = {
         "num_generated_images": n_g,
         "num_real_images": n_r,
-        "num_generated_spatial_vectors": ns_g,
-        "num_real_spatial_vectors": ns_r,
+        "num_generated_spatial_features": ns_g,
+        "num_real_spatial_features": ns_r,
         "FID": fid,
+        "FID_backend": args.fid_backend,
         "sFID": sfid,
         "CLIP_mean_cosine": mean_cos,
         "CLIP_score_x100": clip_score,

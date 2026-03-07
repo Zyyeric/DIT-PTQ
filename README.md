@@ -96,4 +96,5 @@ Notes:
 - `--caption_mode coco_10k` matches generation with `--coco_10k`.
 - For `--coco_9k`, use `--caption_mode coco_9k` and `samples_9k`.
 - CLIP-score prompt source can also be `--prompt_file` (one prompt/line) or `--prompt` (single prompt for all images).
-- `sFID` here is computed from Inception-v3 `Mixed_6e` spatial features (patch-level statistics), while `FID` uses global pooled Inception features.
+- `FID` now uses `clean-fid` by default. To reproduce the previous repo-local implementation, pass `--fid_backend custom`.
+- `sFID` uses flattened Inception-v3 `Mixed_6e` spatial features with one spatial descriptor per image, following the common TensorFlow-style evaluator pattern.

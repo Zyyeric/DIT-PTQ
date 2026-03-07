@@ -21,6 +21,7 @@ imageio-ffmpeg==0.4.2
 test-tube>=0.7.5
 streamlit>=0.73.1
 torch-fidelity==0.3.0
+clean-fid==0.1.35
 torchmetrics==0.6.0
 streamlit-drawable-canvas==0.8
 einops==0.3.0
