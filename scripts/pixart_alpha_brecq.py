@@ -27,6 +27,14 @@ from qdiff import (
 from qdiff.adaptive_rounding import AdaRoundQuantizer
 from qdiff.quant_layer import UniformAffineQuantizer
 from qdiff.utils import resume_cali_model, get_train_samples_custom, convert_adaround, pixart_alpha_aca_dict
+from qdiff.nvtx import (
+    DenoisingStepTracker,
+    nvtx_range,
+    wrap_module_forward,
+    wrap_named_modules_by_predicate,
+    wrap_named_modules_by_suffix,
+    wrap_object_method,
+)
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers import DiTPipeline, DPMSolverMultistepScheduler
 from transformers import AutoFeatureExtractor
@@ -37,6 +45,26 @@ logger = logging.getLogger(__name__)
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
 safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+
+
+LEAF_NVTX_SUFFIXES = {
+    ".attn1.to_out.0": "attn1.to_out",
+    ".attn2.to_out.0": "attn2.to_out",
+    ".ff.net.0.proj": "ff.net.0.proj",
+    ".attn1.to_q": "attn1.to_q",
+    ".attn1.to_k": "attn1.to_k",
+    ".attn1.to_v": "attn1.to_v",
+    ".attn2.to_q": "attn2.to_q",
+    ".attn2.to_k": "attn2.to_k",
+    ".attn2.to_v": "attn2.to_v",
+    ".ff.net.2": "ff.net.2",
+}
+
+PARENT_NVTX_SUFFIXES = {
+    ".attn1": "self_attn",
+    ".attn2": "cross_attn",
+    ".ff": "ffn",
+}
 
 
 def chunk(it, size):
@@ -112,6 +140,77 @@ def finalize_parallel(use_ddp: bool):
     if use_ddp and dist.is_available() and dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
+
+
+def is_transformer_block(name, module):
+    return all(hasattr(module, attr) for attr in ("attn1", "ff", "norm1"))
+
+
+def install_nvtx_instrumentation(pipeline, enabled: bool):
+    step_tracker = DenoisingStepTracker()
+    if not enabled:
+        return step_tracker
+
+    wrap_object_method(pipeline, "encode_prompt", "encode_prompt", enabled=enabled)
+    wrap_object_method(pipeline, "prepare_latents", "prepare_latents", enabled=enabled)
+    wrap_object_method(pipeline, "run_safety_checker", "run_safety_checker", enabled=enabled)
+    if hasattr(pipeline, "image_processor") and pipeline.image_processor is not None:
+        wrap_object_method(pipeline.image_processor, "postprocess", "image_postprocess", enabled=enabled)
+    if hasattr(pipeline, "vae") and pipeline.vae is not None:
+        wrap_object_method(pipeline.vae, "decode", "vae_decode", enabled=enabled)
+
+    transformer = pipeline.transformer
+    wrap_module_forward(
+        transformer,
+        "transformer_forward",
+        enabled=enabled,
+    )
+    wrap_named_modules_by_predicate(
+        transformer,
+        is_transformer_block,
+        "block",
+        enabled=enabled,
+    )
+    wrap_named_modules_by_suffix(
+        transformer,
+        PARENT_NVTX_SUFFIXES,
+        enabled=enabled,
+    )
+    wrap_named_modules_by_suffix(
+        transformer,
+        LEAF_NVTX_SUFFIXES,
+        enabled=enabled,
+    )
+
+    scheduler = pipeline.scheduler
+    wrap_object_method(scheduler, "set_timesteps", "set_timesteps", enabled=enabled)
+    original_scale_model_input = scheduler.scale_model_input
+    original_scheduler_step = scheduler.step
+
+    def wrapped_scale_model_input(*args, **kwargs):
+        step_tracker.begin_step(enabled=enabled)
+        with nvtx_range("scheduler_scale_model_input", enabled=enabled):
+            return original_scale_model_input(*args, **kwargs)
+
+    def wrapped_scheduler_step(*args, **kwargs):
+        try:
+            with nvtx_range("scheduler_step", enabled=enabled):
+                return original_scheduler_step(*args, **kwargs)
+        finally:
+            step_tracker.end_step(enabled=enabled)
+
+    scheduler.scale_model_input = wrapped_scale_model_input
+    scheduler.step = wrapped_scheduler_step
+    return step_tracker
+
+
+def run_generation(pipeline, step_tracker: DenoisingStepTracker, enabled: bool, **kwargs):
+    step_tracker.reset()
+    try:
+        with nvtx_range("pipeline_generate", enabled=enabled):
+            return pipeline(**kwargs)
+    finally:
+        step_tracker.end_step(enabled=enabled)
 
 
 def main():
@@ -440,6 +539,11 @@ def main():
         action="store_true",
         help="When using DDP and dataset prompts, shard prompt generation across ranks.",
     )
+    parser.add_argument(
+        "--nvtx_profile",
+        action="store_true",
+        help="Add NVTX ranges for generation, denoising steps, transformer blocks, attention, and FFN projections.",
+    )
     opt = parser.parse_args()
     parallel_mode, use_ddp, rank, local_rank, world_size, device = init_parallel(
         opt.parallelism, opt.ddp_backend
@@ -717,6 +821,8 @@ def main():
 
         qnn = qnn.to(device=device, dtype=torch.float16)
         model.transformer = qnn
+
+    step_tracker = install_nvtx_instrumentation(model, opt.nvtx_profile)
     
     #model.text_encoder = model.text_encoder.to("cuda")
 
@@ -746,7 +852,10 @@ def main():
             torch.manual_seed(42)
             batch_idx = local_indices[start:start + batch_size]
             prompt_embeds = pes[batch_idx].to(device)
-            image = model(
+            image = run_generation(
+                model,
+                step_tracker,
+                opt.nvtx_profile,
                 prompt=None,
                 negative_prompt=None,
                 prompt_embeds=prompt_embeds,
@@ -785,19 +894,33 @@ def main():
             for i in tqdm(range(0, pes.shape[0], batch_size), desc="data"):
                 torch.manual_seed(42) # Meaning of Life, the Universe and Everything
                 prompt_embeds = pes[i:i + batch_size].to(device)
-                image = model(prompt=None, negative_prompt=None,
-                            prompt_embeds=prompt_embeds,
-                            prompt_attention_mask = pams[i:i + batch_size].to(device),
-                            negative_prompt_embeds = npe.expand(prompt_embeds.shape[0], -1, -1),
-                            negative_prompt_attention_mask = npam.expand(prompt_embeds.shape[0], -1),
-                            height=opt.res, width=opt.res).images
+                image = run_generation(
+                    model,
+                    step_tracker,
+                    opt.nvtx_profile,
+                    prompt=None,
+                    negative_prompt=None,
+                    prompt_embeds=prompt_embeds,
+                    prompt_attention_mask=pams[i:i + batch_size].to(device),
+                    negative_prompt_embeds=npe.expand(prompt_embeds.shape[0], -1, -1),
+                    negative_prompt_attention_mask=npam.expand(prompt_embeds.shape[0], -1),
+                    height=opt.res,
+                    width=opt.res,
+                ).images
 
                 for j, img in enumerate(image):
                     img.save(os.path.join(sample_path, f"{i+j}.png"))
         else:
             torch.manual_seed(42) # Meaning of Life, the Universe and Everything
             prompt = [opt.prompt]
-            image = model(prompt=prompt, height=opt.res, width=opt.res).images
+            image = run_generation(
+                model,
+                step_tracker,
+                opt.nvtx_profile,
+                prompt=prompt,
+                height=opt.res,
+                width=opt.res,
+            ).images
 
             for j, img in enumerate(image):
                 img.save(os.path.join(sample_path, f"{j}.png"))
