@@ -81,7 +81,7 @@ python scripts/pixart_alpha_brecq.py --plms --cond --n_samples 1 --outdir <outpu
 python scripts/pixart_alpha_brecq.py --plms --cond --n_samples 1 --outdir <output_dir> --ptq --weight_bit 4 --quant_mode qdiff --cali_data_path pixart_calib_brecq.pt --cali_batch_size 16 --cali_iters 2500 --cali_iters_a 1 --quant_act --act_bit <6_or_8> --act_mantissa_bits <3_for_A6_or_4_for_A8> --cali_ckpt <ckpt> --resume_w --weight_group_size 128 --weight_mantissa_bits 1 --ff_weight_mantissa 0 --res 512 --coco_10k
 ```
 
-### 6) Evaluate (FID / sFID / CLIP-score)
+### 6) Evaluate (FID / CLIP-score / ImageReward)
 After generation, run:
 ```bash
 python scripts/eval_metrics.py \
@@ -96,5 +96,6 @@ Notes:
 - `--caption_mode coco_10k` matches generation with `--coco_10k`.
 - For `--coco_9k`, use `--caption_mode coco_9k` and `samples_9k`.
 - CLIP-score prompt source can also be `--prompt_file` (one prompt/line) or `--prompt` (single prompt for all images).
-- `FID` now uses `clean-fid` by default. To reproduce the previous repo-local implementation, pass `--fid_backend custom`.
-- `sFID` uses flattened Inception-v3 `Mixed_6e` spatial features with one spatial descriptor per image, following the common TensorFlow-style evaluator pattern.
+- `FID` uses `clean-fid` by default. To reproduce the previous repo-local implementation, pass `--fid_backend custom`.
+- `ImageReward_mean` is computed against the same validation prompts used for generation unless `--skip_imagereward` is passed.
+- `sFID` is hidden from the default path for now. If you explicitly want the repo-local experimental spatial metric, pass `--compute_sfid`.

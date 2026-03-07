@@ -1,6 +1,5 @@
 import argparse
 import json
-import math
 import os
 import shutil
 import tempfile
@@ -12,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 from torchvision.models import Inception_V3_Weights, inception_v3
 from torchvision.models.feature_extraction import create_feature_extractor
 from torchvision.transforms import functional as TF
@@ -227,6 +227,33 @@ def compute_clip_score(
     return mean_cos, clip_score
 
 
+def compute_image_reward(
+    image_paths: List[Path],
+    prompts: List[str],
+) -> float:
+    try:
+        import ImageReward as RM
+    except ImportError as exc:
+        raise RuntimeError(
+            "ImageReward is not installed. Install it with `pip install image-reward` "
+            "or pass `--skip_imagereward`."
+        ) from exc
+
+    model = RM.load("ImageReward-v1.0")
+    scores = []
+    with torch.no_grad():
+        for path, prompt in tqdm(
+            list(zip(image_paths, prompts)),
+            desc="ImageReward",
+            total=len(image_paths),
+        ):
+            score = model.score(prompt, str(path))
+            if isinstance(score, (list, tuple)):
+                score = score[0]
+            scores.append(float(score))
+    return float(np.mean(scores))
+
+
 def compute_clean_fid_from_paths(gen_images: List[Path], real_images: List[Path], mode: str) -> float:
     try:
         from cleanfid import fid
@@ -245,7 +272,7 @@ def compute_clean_fid_from_paths(gen_images: List[Path], real_images: List[Path]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate generated images with FID, sFID, and CLIP-score.")
+    parser = argparse.ArgumentParser(description="Evaluate generated images with FID, CLIP-score, and ImageReward.")
     parser.add_argument("--gen_dir", type=str, required=True, help="Directory containing generated images.")
     parser.add_argument("--real_dir", type=str, required=True, help="Directory containing real reference images.")
     parser.add_argument("--captions_json", type=str, default=None, help="COCO captions JSON (e.g., captions_val2017.json).")
@@ -278,6 +305,16 @@ def main():
         choices=["clean", "legacy", "clip"],
         help="clean-fid preprocessing mode when `--fid_backend clean-fid` is used.",
     )
+    parser.add_argument(
+        "--compute_sfid",
+        action="store_true",
+        help="Compute the repo-local sFID metric. Disabled by default because it is expensive and not needed for standard eval runs.",
+    )
+    parser.add_argument(
+        "--skip_imagereward",
+        action="store_true",
+        help="Skip ImageReward scoring. By default ImageReward is computed using the validation prompts.",
+    )
     parser.add_argument("--save_json", type=str, default=None, help="Optional output json path.")
     args = parser.parse_args()
 
@@ -291,12 +328,29 @@ def main():
         real_images = real_images[: args.max_real_images]
 
     if len(gen_images) < 2 or len(real_images) < 2:
-        raise RuntimeError("Need at least 2 generated and 2 real images to compute FID/sFID.")
+        raise RuntimeError("Need at least 2 generated and 2 real images to compute FID.")
 
     if args.fid_backend == "clean-fid":
         fid = compute_clean_fid_from_paths(gen_images, real_images, mode=args.clean_fid_mode)
         n_g = len(gen_images)
         n_r = len(real_images)
+        sfid = None
+        ns_g = None
+        ns_r = None
+    else:
+        extractor, mean, std = get_inception_extractor(device)
+        mu_g, cov_g, _, _, n_g, _ = running_stats_from_paths(
+            gen_images, extractor, mean, std, device, args.batch_size, args.num_workers
+        )
+        mu_r, cov_r, _, _, n_r, _ = running_stats_from_paths(
+            real_images, extractor, mean, std, device, args.batch_size, args.num_workers
+        )
+        fid = frechet_distance(mu_g, cov_g, mu_r, cov_r)
+        sfid = None
+        ns_g = None
+        ns_r = None
+
+    if args.compute_sfid:
         extractor, mean, std = get_inception_extractor(device)
         _, _, mu_gs, cov_gs, _, ns_g = running_stats_from_paths(
             gen_images, extractor, mean, std, device, args.batch_size, args.num_workers
@@ -304,16 +358,6 @@ def main():
         _, _, mu_rs, cov_rs, _, ns_r = running_stats_from_paths(
             real_images, extractor, mean, std, device, args.batch_size, args.num_workers
         )
-        sfid = frechet_distance(mu_gs, cov_gs, mu_rs, cov_rs)
-    else:
-        extractor, mean, std = get_inception_extractor(device)
-        mu_g, cov_g, mu_gs, cov_gs, n_g, ns_g = running_stats_from_paths(
-            gen_images, extractor, mean, std, device, args.batch_size, args.num_workers
-        )
-        mu_r, cov_r, mu_rs, cov_rs, n_r, ns_r = running_stats_from_paths(
-            real_images, extractor, mean, std, device, args.batch_size, args.num_workers
-        )
-        fid = frechet_distance(mu_g, cov_g, mu_r, cov_r)
         sfid = frechet_distance(mu_gs, cov_gs, mu_rs, cov_rs)
 
     prompts = load_prompts(
@@ -326,18 +370,21 @@ def main():
     mean_cos, clip_score = compute_clip_score(
         image_paths=gen_images, prompts=prompts, device=device, batch_size=args.clip_batch_size
     )
+    image_reward = None if args.skip_imagereward else compute_image_reward(gen_images, prompts)
 
     result = {
         "num_generated_images": n_g,
         "num_real_images": n_r,
-        "num_generated_spatial_features": ns_g,
-        "num_real_spatial_features": ns_r,
         "FID": fid,
         "FID_backend": args.fid_backend,
-        "sFID": sfid,
         "CLIP_mean_cosine": mean_cos,
         "CLIP_score_x100": clip_score,
+        "ImageReward_mean": image_reward,
     }
+    if sfid is not None:
+        result["sFID"] = sfid
+        result["num_generated_spatial_features"] = ns_g
+        result["num_real_spatial_features"] = ns_r
 
     print(json.dumps(result, indent=2))
     if args.save_json is not None:
