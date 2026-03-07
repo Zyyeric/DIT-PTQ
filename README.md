@@ -72,8 +72,24 @@ python scripts/pixart_alpha_calib.py
 This creates `pixart_calib_brecq.pt`.
 
 ### 4) Quantize + Generate
+
+
+- Run 1: INT4 + GPTQ (The Baseline)
 ```bash
-python scripts/pixart_alpha_brecq.py --plms --cond --n_samples 1 --outdir <output_dir> --ptq --weight_bit 4 --quant_mode qdiff --cali_data_path pixart_calib_brecq.pt --cali_batch_size 16 --cali_iters 2500 --cali_iters_a 1 --quant_act --act_bit <6_or_8> --act_mantissa_bits <3_for_A6_or_4_for_A8> --weight_group_size 128 --weight_mantissa_bits 1 --ff_weight_mantissa 0 --res 512 --coco_10k
+python scripts/pixart_alpha_brecq.py   --cond --n_samples 1 --res 512 --coco_10k   --outdir outputs/int4_gptq_run   --cali_data_path pixart_calib_brecq.pt   --ptq --quant_mode qdiff   --cali_batch_size 16   --weight_bit 4 --weight_group_size 128   --disable_fp_quant   --gptq   --gptq_groupsize 128   --gptq_blocksize 128   --w_sym   --w_clip_ratio 1.0
+```
+
+- Run 2: FP4 + BRECQ,AdaRound (The Q-DiT Challenger)
+```bash
+python scripts/pixart_alpha_brecq.py \
+  --plms --cond --n_samples 1 --res 512 --coco_10k \
+  --outdir outputs/fp4_brecq_run \
+  --cali_data_path pixart_calib_brecq.pt \
+  --ptq --quant_mode qdiff \
+  --cali_batch_size 16 --cali_iters 2500 --cali_iters_a 1 \
+  --weight_bit 4 --weight_group_size 128 \
+  --weight_mantissa_bits 1 --ff_weight_mantissa 0 \
+  --quant_act --act_bit 8 --act_mantissa_bits 4
 ```
 
 ### 5) Resume from Existing Checkpoint

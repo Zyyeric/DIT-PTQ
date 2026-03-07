@@ -1,5 +1,6 @@
 import argparse, os, datetime, gc, yaml
 import logging
+import time
 import cv2
 import numpy as np
 from omegaconf import OmegaConf
@@ -9,24 +10,15 @@ from imwatermark import WatermarkEncoder
 from itertools import islice
 from einops import rearrange
 from torchvision.utils import make_grid
-import time
 from pytorch_lightning import seed_everything
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from torch import autocast
 from contextlib import nullcontext
-
-from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.plms import PLMSSampler
 from qdiff import (
-    QuantModel, QuantModule, BaseQuantBlock, 
+    QuantModel, QuantModule, BaseQuantBlock,
     block_reconstruction, layer_reconstruction,
 )
-from qdiff.adaptive_rounding import AdaRoundQuantizer
-from qdiff.quant_layer import UniformAffineQuantizer
-from qdiff.utils import resume_cali_model, get_train_samples_custom, convert_adaround, pixart_alpha_aca_dict
 from qdiff.nvtx import (
     DenoisingStepTracker,
     nvtx_range,
@@ -35,9 +27,37 @@ from qdiff.nvtx import (
     wrap_named_modules_by_suffix,
     wrap_object_method,
 )
+from qdiff.adaptive_rounding import AdaRoundQuantizer
+from qdiff.quant_layer import UniformAffineQuantizer
+from qdiff.utils import resume_cali_model, get_train_samples_custom, convert_adaround, pixart_alpha_aca_dict, save_inp_oup_data
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from diffusers import DiTPipeline, DPMSolverMultistepScheduler
 from transformers import AutoFeatureExtractor
+
+# ── logging helpers (mirrors pixart_calib.py style) ──────────────────────────
+def _now():
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+def log(msg, level="info"):
+    fn = getattr(logger, level, logger.info)
+    fn(f"[{_now()}] {msg}")
+
+def log_gpu(tag=""):
+    if torch.cuda.is_available():
+        alloc  = torch.cuda.memory_allocated()  / 1024**3
+        reserv = torch.cuda.memory_reserved()   / 1024**3
+        total  = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        label  = f" [{tag}]" if tag else ""
+        log(f"GPU{label}  allocated={alloc:.2f}GB  reserved={reserv:.2f}GB  total={total:.2f}GB")
+
+def elapsed(t0):
+    return f"{time.time()-t0:.1f}s"
+
+def count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    quant = sum(p.numel() for n, p in model.named_parameters() if 'weight' in n and p.dtype in [torch.float16, torch.float32])
+    return total, quant
+# ─────────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +65,6 @@ logger = logging.getLogger(__name__)
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
 safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
-
 
 LEAF_NVTX_SUFFIXES = {
     ".attn1.to_out.0": "attn1.to_out",
@@ -65,23 +84,16 @@ PARENT_NVTX_SUFFIXES = {
     ".attn2": "cross_attn",
     ".ff": "ffn",
 }
-
-
 def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
 
 
 def numpy_to_pil(images):
-    """
-    Convert a numpy image or a batch of images to a PIL image.
-    """
     if images.ndim == 3:
         images = images[None, ...]
     images = (images * 255).round().astype("uint8")
-    pil_images = [Image.fromarray(image) for image in images]
-
-    return pil_images
+    return [Image.fromarray(image) for image in images]
 
 
 def put_watermark(img, wm_encoder=None):
@@ -113,35 +125,6 @@ def check_safety(x_image):
     return x_checked_image, has_nsfw_concept
 
 
-def init_parallel(parallelism: str, backend: str):
-    mode = parallelism.lower()
-    if mode == "dp":
-        mode = "ddp"
-
-    if mode != "ddp":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return mode, False, 0, 0, 1, device
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("--parallelism ddp requires CUDA.")
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        raise RuntimeError("--parallelism ddp must be launched with torchrun (RANK/WORLD_SIZE env vars missing).")
-
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend=backend, init_method="env://")
-    device = torch.device(f"cuda:{local_rank}")
-    return mode, True, rank, local_rank, world_size, device
-
-
-def finalize_parallel(use_ddp: bool):
-    if use_ddp and dist.is_available() and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
-
 def is_transformer_block(name, module):
     return all(hasattr(module, attr) for attr in ("attn1", "ff", "norm1"))
 
@@ -151,6 +134,67 @@ def suppress_quant_module_prints(module):
         if isinstance(submodule, QuantModule):
             submodule.run_prints = False
 
+rank = int(os.environ["RANK"])
+def install_nvtx_instrumentation(pipeline, enabled: bool):
+    step_tracker = DenoisingStepTracker()
+    if not enabled:
+        return step_tracker
+
+    wrap_object_method(pipeline, "encode_prompt", "encode_prompt", enabled=enabled)
+    wrap_object_method(pipeline, "prepare_latents", "prepare_latents", enabled=enabled)
+    wrap_object_method(pipeline, "run_safety_checker", "run_safety_checker", enabled=enabled)
+    if hasattr(pipeline, "image_processor") and pipeline.image_processor is not None:
+        wrap_object_method(pipeline.image_processor, "postprocess", "image_postprocess", enabled=enabled)
+    if hasattr(pipeline, "vae") and pipeline.vae is not None:
+        wrap_object_method(pipeline.vae, "decode", "vae_decode", enabled=enabled)
+
+    transformer = pipeline.transformer
+    wrap_module_forward(
+        transformer,
+        "transformer_forward",
+        enabled=enabled,
+    )
+    wrap_named_modules_by_predicate(
+        transformer,
+        is_transformer_block,
+        "block",
+        enabled=enabled,
+    )
+    wrap_named_modules_by_suffix(
+        transformer,
+        PARENT_NVTX_SUFFIXES,
+        enabled=enabled,
+    )
+    wrap_named_modules_by_suffix(
+        transformer,
+        LEAF_NVTX_SUFFIXES,
+        enabled=enabled,
+    )
+
+    scheduler = pipeline.scheduler
+    wrap_object_method(scheduler, "set_timesteps", "set_timesteps", enabled=enabled)
+    original_scale_model_input = scheduler.scale_model_input
+    original_scheduler_step = scheduler.step
+
+    def wrapped_scale_model_input(*args, **kwargs):
+        step_tracker.begin_step(enabled=enabled)
+        with nvtx_range("scheduler_scale_model_input", enabled=enabled):
+            return original_scale_model_input(*args, **kwargs)
+
+    def wrapped_scheduler_step(*args, **kwargs):
+        try:
+            with nvtx_range("scheduler_step", enabled=enabled):
+                return original_scheduler_step(*args, **kwargs)
+        finally:
+            step_tracker.end_step(enabled=enabled)
+
+    scheduler.scale_model_input = wrapped_scale_model_input
+    scheduler.step = wrapped_scheduler_step
+    return step_tracker
+
+
+def is_transformer_block(name, module):
+    return all(hasattr(module, attr) for attr in ("attn1", "ff", "norm1"))
 
 def install_nvtx_instrumentation(pipeline, enabled: bool):
     step_tracker = DenoisingStepTracker()
@@ -218,393 +262,197 @@ def run_generation(pipeline, step_tracker: DenoisingStepTracker, enabled: bool, 
     finally:
         step_tracker.end_step(enabled=enabled)
 
-
 def main():
+    SCRIPT_START = time.time()
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--prompt", type=str, default=None)
+    parser.add_argument("--max_prompts", type=int, default=None)
+    parser.add_argument("--outdir", type=str, nargs="?", default="outputs/txt2img-samples")
+    parser.add_argument("--skip_grid", action='store_true')
+    parser.add_argument("--skip_save", action='store_true')
+    parser.add_argument("--ddim_steps", type=int, default=20)
+    parser.add_argument("--fixed_code", action='store_true')
+    parser.add_argument("--ddim_eta", type=float, default=0.0)
+    parser.add_argument("--n_iter", type=int, default=1)
+    # FIX 1: --res drives model selection (512 → 512x512, 1024 → 1024-MS)
+    parser.add_argument("--res", type=int, default=512, choices=[512, 1024],
+                        help="Resolution; also selects PixArt model variant. "
+                             "Must match the resolution used when generating calib data.")
+    parser.add_argument("--C", type=int, default=4)
+    parser.add_argument("--f", type=int, default=8)
+    parser.add_argument("--n_samples", type=int, default=1)
+    parser.add_argument("--n_rows", type=int, default=0)
+    parser.add_argument("--scale", type=float, default=7.5)
+    parser.add_argument("--from-file", type=str)
+    parser.add_argument("--config", type=str, default="configs/stable-diffusion/v1-inference.yaml")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--precision", type=str, choices=["full", "autocast"], default="autocast")
 
-    parser.add_argument(
-    "--prompt",
-    type=str,
-    default=None,
-    help="the prompt to render; if not provided, uses dataset captions"
-    )
-    parser.add_argument(
-        "--max_prompts",
-        type=int,
-        default=None,
-        help="limit number of caption prompts used for generation when --prompt is not set",
-    )
+    # quantization configs
+    parser.add_argument("--ptq", action="store_true")
+    parser.add_argument("--quant_act", action="store_true")
+    parser.add_argument("--weight_bit", type=int, default=8)
+    parser.add_argument("--act_bit", type=int, default=8)
+    parser.add_argument("--quant_mode", type=str, default="symmetric", choices=["linear", "squant", "qdiff"])
 
-    parser.add_argument(
-        "--outdir",
-        type=str,
-        nargs="?",
-        help="dir to write results to",
-        default="outputs/txt2img-samples"
-    )
-    parser.add_argument(
-        "--skip_grid",
-        action='store_true',
-        help="do not save a grid, only individual samples. Helpful when evaluating lots of samples",
-    )
-    parser.add_argument(
-        "--skip_save",
-        action='store_true',
-        help="do not save individual samples. For speed measurements.",
-    )
-    parser.add_argument(
-        "--ddim_steps",
-        type=int,
-        default=20,
-        help="number of ddim sampling steps",
-    )
-    parser.add_argument(
-        "--plms",
-        action='store_true',
-        help="use plms sampling",
-    )
-    parser.add_argument(
-        "--laion400m",
-        action='store_true',
-        help="uses the LAION400M model",
-    )
-    parser.add_argument(
-        "--fixed_code",
-        action='store_true',
-        help="if enabled, uses the same starting code across samples ",
-    )
-    parser.add_argument(
-        "--ddim_eta",
-        type=float,
-        default=0.0,
-        help="ddim eta (eta=0.0 corresponds to deterministic sampling",
-    )
-    parser.add_argument(
-        "--n_iter",
-        type=int,
-        default=1,
-        help="sample this often",
-    )
-    parser.add_argument(
-        "--res",
-        type=int,
-        default=512,
-        help="image height, in pixel space",
-    )
-    #parser.add_argument(
-    #   "--W",
-    #    type=int,
-    #    default=1024,
-    #    help="image width, in pixel space",
-    #)
-    parser.add_argument(
-        "--C",
-        type=int,
-        default=4,
-        help="latent channels",
-    )
-    parser.add_argument(
-        "--f",
-        type=int,
-        default=8,
-        help="downsampling factor",
-    )
-    parser.add_argument(
-        "--n_samples",
-        type=int,
-        default=1,
-        help="how many samples to produce for each given prompt. A.k.a. batch size",
-    )
-    parser.add_argument(
-        "--n_rows",
-        type=int,
-        default=0,
-        help="rows in the grid (default: n_samples)",
-    )
-    parser.add_argument(
-        "--scale",
-        type=float,
-        default=7.5,
-        help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
-    )
-    parser.add_argument(
-        "--from-file",
-        type=str,
-        help="if specified, load prompts from this file",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/stable-diffusion/v1-inference.yaml",
-        help="path to config which constructs model",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="the seed (for reproducible sampling)",
-    )
-    parser.add_argument(
-        "--precision",
-        type=str,
-        help="evaluate at this precision",
-        choices=["full", "autocast"],
-        default="autocast"
-    )
-    # linear quantization configs
-    parser.add_argument(
-        "--ptq", action="store_true", help="apply post-training quantization"
-    )
-    parser.add_argument(
-        "--quant_act", action="store_true", 
-        help="if to quantize activations when ptq==True"
-    )
-    parser.add_argument(
-        "--weight_only", action="store_true",
-        help="Quantize weights only and keep activations in FP16/BF16.",
-    )
-    parser.add_argument(
-        "--act_only", action="store_true",
-        help="Quantize activations only and keep weights in FP16/BF16.",
-    )
-    parser.add_argument(
-        "--weight_bit",
-        type=int,
-        default=8,
-        help="int bit for weight quantization",
-    )
-    parser.add_argument(
-        "--act_bit",
-        type=int,
-        default=8,
-        help="int bit for activation quantization",
-    )
-    parser.add_argument(
-        "--quant_mode", type=str, default="symmetric", 
-        choices=["linear", "squant", "qdiff"], 
-        help="quantization mode to use"
-    )
-
-    # qdiff specific configs
-    parser.add_argument(
-        "--cali_st", type=int, default=20, 
-        help="number of timesteps used for calibration"
-    )
-    parser.add_argument(
-        "--cali_batch_size", type=int, default=8, 
-        help="batch size for qdiff reconstruction"
-    )
-    parser.add_argument(
-        "--cali_n", type=int, default=128, 
-        help="number of samples for each timestep for qdiff reconstruction"
-    )
-    parser.add_argument(
-        "--cali_iters", type=int, default=20000, 
-        help="number of iterations for each qdiff reconstruction"
-    )
-    parser.add_argument('--cali_iters_a', default=5000, type=int, 
-        help='number of iteration for LSQ')
-    parser.add_argument('--cali_lr', default=4e-4, type=float, 
-        help='learning rate for LSQ')
-    parser.add_argument('--cali_p', default=2.4, type=float, 
-        help='L_p norm minimization for LSQ')
-    parser.add_argument(
-        "--cali_ckpt", type=str,
-        help="path for calibrated model ckpt"
-    )
-    parser.add_argument(
-        "--cali_data_path", type=str, default="pixart_calib_brecq.pt",
-        help="calibration dataset name"
-    )
-    parser.add_argument(
-        "--resume", action="store_true",
-        help="resume the calibrated qdiff model"
-    )
-    parser.add_argument(
-        "--adaround", action="store_true",
-        help="resume the calibrated qdiff model"
-    )
-    parser.add_argument(
-        "--resume_w", action="store_true",
-        help="resume the calibrated qdiff model weights only"
-    )
-    parser.add_argument(
-        "--cond", action="store_true",
-        help="whether to use conditional guidance"
-    )
-    parser.add_argument(
-        "--no_grad_ckpt", action="store_true",
-        help="disable gradient checkpointing"
-    )
-    parser.add_argument(
-        "--split", action="store_true",
-        help="use split strategy in skip connection"
-    )
-    parser.add_argument(
-        "--running_stat", action="store_true",
-        help="use running statistics for act quantizers"
-    )
-    parser.add_argument(
-        "--rs_sm_only", action="store_true",
-        help="use running statistics only for softmax act quantizers"
-    )
-    parser.add_argument(
-        "--sm_abit",type=int, default=16,
-        help="attn softmax activation bit"
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="print out info like quantized model arch"
-    )
-    parser.add_argument(
-        "--refiner", action="store_true", default=False,
-        help="use SDXL refiner")
-    parser.add_argument(
-        "--sequential_w", action="store_true", default=False,
-        help="Sequential weight quantization")
-    parser.add_argument(
-        "--sequential_a", action="store_true", default=False,
-        help="Sequential activation quantization")
-    parser.add_argument(
-        "--weight_mantissa_bits",
-        type=int,
-        default=None,
-        help="weight_mantissa bit",
-    )
-    parser.add_argument(
-        "--act_mantissa_bits",
-        type=int,
-        default=None,
-        help="weight_mantissa bit",
-    )
-    parser.add_argument(
-    "--no_adaround", action="store_true",
-    help="Disable adaround in weight quantization"
-    )
-    parser.add_argument(
-        "--attn_weight_mantissa",
-        type=int,
-        default=None,
-        help="mantissa bit for weight quantization",
-    )
-    parser.add_argument(
-        "--ff_weight_mantissa",
-        type=int,
-        default=None,
-        help="mantissa bit for feed forward weight",
-    )
-    parser.add_argument(
-    "--asym_softmax", action="store_true", default=False,
-    help="Use asymmetric quantization for attention's softmax and get an extra bits, default is using asymmetric"
-    )
-    parser.add_argument(
-        "--weight_group_size",
-        type=int,
-        default=128,
-        help="independent quantization to groups of <size> consecutive weights",
-    )
-    parser.add_argument(
-    "--no_fp_biased_adaround", action="store_false",
-    help="Disable FP scale awared adaround"
-    )
-    parser.add_argument(
-    "--disable_online_act_quant", action="store_true",
-    help="Disable online activation quantization"
-    )
-    parser.add_argument(
-        "--coco_9k", action="store_true", default=False,
-        help="generate images for coco val prompts 1000-9999")
-    parser.add_argument(
-        "--coco_10k", action="store_true", default=False,
-        help="generate images for coco val prompts 0-9999")
-    parser.add_argument(
-        "--coco2014", action="store_true", default=False,
-        help="generate images for coco 2014 prompts 0-9999")
-    parser.add_argument(
-        "--hpsv2", action="store_true", default=False,
-        help="generate images for coco 2014 prompts 0-9999")
-    parser.add_argument(
-        "--pixart", action="store_true", default=False,
-        help="generate images for 120 high-detailed pixart prompts (no ground truth)")
-    parser.add_argument(
-    "--disable_fp_quant", action="store_true",
-    help="Use integer quantization"
-    )
-    parser.add_argument(
-    "--disable_group_quant", action="store_true",
-    help="Disable group weight quantization"
-    )
-    parser.add_argument(
-        "--parallelism",
-        type=str,
-        default="none",
-        choices=["none", "dp", "ddp"],
-        help="Calibration parallelism mode. 'dp' is treated as 'ddp'.",
-    )
-    parser.add_argument(
-        "--ddp_backend",
-        type=str,
-        default="nccl",
-        choices=["nccl", "gloo"],
-        help="Distributed backend when --parallelism=ddp.",
-    )
-    parser.add_argument(
-        "--parallel_generate",
-        action="store_true",
-        help="When using DDP and dataset prompts, shard prompt generation across ranks.",
-    )
+    # qdiff configs
+    parser.add_argument("--cali_st", type=int, default=20)
+    parser.add_argument("--cali_batch_size", type=int, default=8)
+    parser.add_argument("--cali_n", type=int, default=128)
+    parser.add_argument("--cali_iters", type=int, default=10000,
+                        help="BRECQ iterations (unused when --gptq is set)")
+    parser.add_argument('--cali_iters_a', default=1000, type=int,
+                        help='LSQ activation calibration iterations. '
+                             'Values <100 effectively disable act calibration.')
+    parser.add_argument('--cali_lr', default=4e-4, type=float)
+    parser.add_argument('--cali_p', default=2.4, type=float)
+    parser.add_argument("--cali_ckpt", type=str)
+    parser.add_argument("--cali_data_path", type=str, default="pixart_calib_brecq.pt")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--adaround", action="store_true")
+    parser.add_argument("--resume_w", action="store_true")
+    parser.add_argument("--cond", action="store_true")
+    parser.add_argument("--no_grad_ckpt", action="store_true")
+    parser.add_argument("--split", action="store_true")
+    parser.add_argument("--running_stat", action="store_true")
+    parser.add_argument("--rs_sm_only", action="store_true")
+    parser.add_argument("--sm_abit", type=int, default=16)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--refiner", action="store_true", default=False)
+    parser.add_argument("--sequential_w", action="store_true", default=False)
+    parser.add_argument("--sequential_a", action="store_true", default=False)
+    parser.add_argument("--weight_mantissa_bits", type=int, default=None)
+    parser.add_argument("--act_mantissa_bits", type=int, default=None)
+    parser.add_argument("--no_adaround", action="store_true")
+    parser.add_argument("--attn_weight_mantissa", type=int, default=None)
+    parser.add_argument("--ff_weight_mantissa", type=int, default=None)
+    parser.add_argument("--asym_softmax", action="store_true", default=False)
+    parser.add_argument("--weight_group_size", type=int, default=128)
+    parser.add_argument("--no_fp_biased_adaround", action="store_false")
+    parser.add_argument("--disable_online_act_quant", action="store_true")
+    parser.add_argument("--coco_9k", action="store_true", default=False)
+    parser.add_argument("--coco_10k", action="store_true", default=False)
+    parser.add_argument("--coco2014", action="store_true", default=False)
+    parser.add_argument("--hpsv2", action="store_true", default=False)
+    parser.add_argument("--pixart", action="store_true", default=False)
+    parser.add_argument("--disable_fp_quant", action="store_true")
+    parser.add_argument("--disable_group_quant", action="store_true")
+    parser.add_argument("--weight_quant_method", type=str, default="mse", choices=["max", "mse"])
+    parser.add_argument("--act_quant_method", type=str, default="mse", choices=["max", "mse"])
+    parser.add_argument("--gptq", action="store_true",
+                        help="Use GPTQ. Mutually exclusive with BRECQ (skipped automatically).")
+    parser.add_argument("--gptq_percdamp", type=float, default=0.01)
+    parser.add_argument("--gptq_groupsize", type=int, default=-1)
+    parser.add_argument("--gptq_blocksize", type=int, default=128)
     parser.add_argument(
         "--nvtx_profile",
         action="store_true",
         help="Add NVTX ranges for generation, denoising steps, transformer blocks, attention, and FFN projections.",
     )
-    opt = parser.parse_args()
-    parallel_mode, use_ddp, rank, local_rank, world_size, device = init_parallel(
-        opt.parallelism, opt.ddp_backend
-    )
-    is_main_process = rank == 0
-    do_parallel_generate = use_ddp and opt.parallel_generate and opt.prompt is None
+    parser.add_argument("--gptq_cali_n", type=int, default=256,
+                        help="Number of calibration samples for GPTQ Hessian collection. "
+                             "128-256 is sufficient — GPTQ is not sensitive to sample count "
+                             "beyond this. Default 256. Full cali_n (e.g. 5120) makes "
+                             "Hessian collection 20-40x slower with negligible quality gain.")
+    parser.add_argument("--w_sym", action="store_true")
+    parser.add_argument("--w_clip_ratio", type=float, default=1.0)
 
-    seed_everything(opt.seed + rank)
+    opt = parser.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(opt.seed)
+
+    # ── FIX 1: model selection from --res ─────────────────────────────────────
+    RES_TO_MODEL = {
+        512:  "PixArt-alpha/PixArt-XL-2-512x512",
+        1024: "PixArt-alpha/PixArt-XL-2-1024-MS",
+    }
+    model_id = RES_TO_MODEL[opt.res]
+
+    # Early calib data shape validation — fail before loading any GPU model
+    if os.path.exists(opt.cali_data_path):
+        _tmp = torch.load(opt.cali_data_path, map_location="cpu")
+        _xs_hw = _tmp['xs'].shape[-1]
+        _expected_hw = opt.res // 8
+        if _xs_hw != _expected_hw:
+            raise ValueError(
+                f"Calibration data spatial size {_xs_hw} does not match "
+                f"--res {opt.res} (expected latent H/W={_expected_hw}). "
+                f"Regenerate calib data at res={opt.res} or adjust --res."
+            )
+        log(f"Calib data shape validated: xs={tuple(_tmp['xs'].shape)}  "
+            f"ts={tuple(_tmp['ts'].shape)}  cs={tuple(_tmp['cs'].shape)}")
+        del _tmp
+    # ─────────────────────────────────────────────────────────────────────────
 
     os.makedirs(opt.outdir, exist_ok=True)
-    run_tag = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S") if is_main_process else None
-    if use_ddp:
-        obj_list = [run_tag]
-        dist.broadcast_object_list(obj_list, src=0)
-        run_tag = obj_list[0]
+    run_tag = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     outpath = os.path.join(opt.outdir, run_tag)
-    if is_main_process:
-        os.makedirs(outpath, exist_ok=True)
-    if use_ddp:
-        dist.barrier()
+    os.makedirs(outpath, exist_ok=True)
 
     log_path = os.path.join(outpath, "run.log")
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
         level=logging.INFO,
-        handlers=(
-            [logging.FileHandler(log_path), logging.StreamHandler()]
-            if is_main_process
-            else [logging.StreamHandler()]
-        )
+        handlers=[logging.FileHandler(log_path), logging.StreamHandler()]
     )
     logger = logging.getLogger(__name__)
-    logger.info(f"parallelism={parallel_mode}, world_size={world_size}, rank={rank}, local_rank={local_rank}")
-    if use_ddp and opt.parallel_generate and opt.prompt is not None and is_main_process:
-        logger.info("--parallel_generate is ignored when --prompt is provided (single prompt path).")
 
+    # ── Header ────────────────────────────────────────────────────────────────
+    log("=" * 70)
+    log("PixArt-Alpha BRECQ/GPTQ Quantization Script")
+    log("=" * 70)
+    log(f"Device        →  {device}"
+        + (f"  ({torch.cuda.get_device_name(0)})" if torch.cuda.is_available() else ""))
+    log(f"Model         →  {model_id}")
+    log(f"Resolution    →  {opt.res}x{opt.res}")
+    log(f"Calib data    →  {opt.cali_data_path}")
+    log(f"Output dir    →  {outpath}")
+    log(f"Seed          →  {opt.seed}")
+    log(f"PTQ           →  {opt.ptq}")
+    if opt.ptq:
+        log(f"  weight_bit={opt.weight_bit}  act_bit={opt.act_bit}  "
+            f"quant_mode={opt.quant_mode}  quant_act={opt.quant_act}")
+        log(f"  gptq={opt.gptq}  gptq_groupsize={opt.gptq_groupsize}  "
+            f"gptq_blocksize={opt.gptq_blocksize}  gptq_percdamp={opt.gptq_percdamp}  "
+            f"gptq_cali_n={opt.gptq_cali_n}")
+        log(f"  cali_batch_size={opt.cali_batch_size}  cali_iters={opt.cali_iters}  "
+            f"cali_iters_a={opt.cali_iters_a}")
+        log(f"  weight_group_size={opt.weight_group_size}  w_sym={opt.w_sym}  "
+            f"w_clip_ratio={opt.w_clip_ratio}")
+        log(f"  disable_fp_quant={opt.disable_fp_quant}  "
+            f"disable_group_quant={opt.disable_group_quant}")
+        if opt.gptq and opt.cali_iters != 10000:
+            log("  NOTE: --cali_iters is unused when --gptq is set (BRECQ skipped)", "warning")
+        if opt.quant_act and opt.cali_iters_a < 100:
+            log(f"  WARNING: --cali_iters_a={opt.cali_iters_a} is very low — "
+                "activation calibration will be effectively disabled.", "warning")
+    log_gpu("startup")
 
+    # ── 1. Load pipeline ──────────────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log(f"STEP 1  Loading pipeline: {model_id} ...")
+    t0 = time.time()
     from diffusers import PixArtAlphaPipeline
-    model = PixArtAlphaPipeline.from_pretrained(
-        "PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=torch.float16
-    ).to(device)
+    model = PixArtAlphaPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to(device)
+    log(f"  Pipeline loaded in {elapsed(t0)}")
+    log(f"  Transformer type  →  {type(model.transformer).__name__}")
+    log(f"  Scheduler type    →  {type(model.scheduler).__name__}")
+    total_p, _ = count_params(model.transformer)
+    log(f"  Transformer params →  {total_p/1e6:.1f}M")
+    log_gpu("after pipeline load")
 
+    # ── 2. Load captions ──────────────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log("STEP 2  Loading captions...")
+    t0 = time.time()
     from qdiff.caption_util import get_captions
     pes, pams, npe, npam = None, None, None, None
-    if opt.prompt is None and (is_main_process or do_parallel_generate):
-        pes, pams, npe, npam = get_captions("alpha", model, 
+    if opt.prompt is None:
+        pes, pams, npe, npam = get_captions("alpha", model,
                             coco_9k=opt.coco_9k,
                             coco_10k=opt.coco_10k,
                             coco2014=opt.coco2014,
@@ -614,25 +462,28 @@ def main():
             if opt.max_prompts <= 0:
                 raise ValueError("--max_prompts must be a positive integer")
             n_prompts = min(opt.max_prompts, pes.shape[0])
-            logger.info(f"Using {n_prompts} prompts out of {pes.shape[0]} available prompts")
+            log(f"  Limiting to {n_prompts} prompts (from {pes.shape[0]} available)")
             pes = pes[:n_prompts]
             pams = pams[:n_prompts]
+        log(f"  Prompt embeds shape  →  {tuple(pes.shape)}")
+        log(f"  Neg prompt embeds    →  {tuple(npe.shape)}")
         model.text_encoder = model.text_encoder.to("cpu")
-
-    if opt.coco_9k:
-        sp = "samples_9k"
-    elif opt.coco_10k:
-        sp = "samples_10k"
-    elif opt.pixart:
-        sp = "samples_pixart"
-    elif opt.coco2014:
-        sp = "samples_2014"
-    elif opt.hpsv2:
-        sp = 'samples_hpsv2'
+        log(f"  Text encoder moved to CPU to free VRAM")
     else:
-        sp = "samples"
+        log(f"  Using single prompt: '{opt.prompt}'")
+    log(f"  Captions ready in {elapsed(t0)}")
+    log_gpu("after captions")
+
+    if opt.coco_9k: sp = "samples_9k"
+    elif opt.coco_10k: sp = "samples_10k"
+    elif opt.pixart: sp = "samples_pixart"
+    elif opt.coco2014: sp = "samples_2014"
+    elif opt.hpsv2: sp = 'samples_hpsv2'
+    else: sp = "samples"
 
     assert(opt.cond)
+
+    # ── 3. Quantization ───────────────────────────────────────────────────────
     if opt.ptq:
         if opt.weight_only and opt.act_only:
             raise ValueError("--weight_only and --act_only are mutually exclusive")
@@ -643,203 +494,465 @@ def main():
         enable_act_quant = opt.quant_act or opt.act_only
         if opt.weight_only:
             enable_act_quant = False
+        log("")
+        log("─" * 60)
+        log("STEP 3  Setting up quantization...")
+        t0 = time.time()
 
-        wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse', 'fp': True, 
-                    'mantissa_bits': opt.weight_mantissa_bits,
-                    'attn_weight_mantissa': opt.attn_weight_mantissa,
-                    'ff_weight_mantissa': opt.ff_weight_mantissa,
-                    'weight_group_size': opt.weight_group_size,
-                    'fp_biased_adaround': opt.no_fp_biased_adaround,
-                    'fp': (not opt.disable_fp_quant),
-                    'group_quant': (not opt.disable_group_quant)
-                    }
-        aq_params = {'n_bits': opt.act_bit, 'channel_wise': False, 'scale_method': 'mse', 'leaf_param':  enable_act_quant, 
-                    'mantissa_bits': opt.act_mantissa_bits,
-                    'asym_softmax': opt.asym_softmax,
-                    'online_act_quant': (not opt.disable_online_act_quant),
-                    'fp': (not opt.disable_fp_quant)
-                    }
+        wq_params = {
+            'n_bits': opt.weight_bit, 'channel_wise': True,
+            'scale_method': opt.weight_quant_method,
+            'mantissa_bits': opt.weight_mantissa_bits,
+            'attn_weight_mantissa': opt.attn_weight_mantissa,
+            'ff_weight_mantissa': opt.ff_weight_mantissa,
+            'weight_group_size': opt.weight_group_size,
+            'fp_biased_adaround': opt.no_fp_biased_adaround,
+            'fp': (not opt.disable_fp_quant),
+            'group_quant': (not opt.disable_group_quant),
+            'sym': opt.w_sym,
+            'clip_ratio': opt.w_clip_ratio
+        }
+        aq_params = {
+            'n_bits': opt.act_bit, 'channel_wise': False,
+            'scale_method': opt.act_quant_method,
+            'leaf_param': enable_act_quant,
+            'mantissa_bits': opt.act_mantissa_bits,
+            'asym_softmax': opt.asym_softmax,
+            'online_act_quant': (not opt.disable_online_act_quant),
+            'fp': (not opt.disable_fp_quant)
+        }
+        log(f"  wq_params: {wq_params}")
+        log(f"  aq_params: {aq_params}")
+
         if opt.resume:
-            logger.info('Load with min-max quick initialization')
+            log("  Scale method overridden to 'max' for resume")
             wq_params['scale_method'] = 'max'
             aq_params['scale_method'] = 'max'
         if opt.resume_w:
             wq_params['scale_method'] = 'max'
+
+        log("  Building QuantModel...")
+        t_qnn = time.time()
         qnn = QuantModel(
-            model=model.transformer, weight_quant_params=wq_params, act_quant_params=aq_params,
-            act_quant_mode="qdiff", sm_abit=opt.sm_abit)
-        #exit(0)
+            model=model.transformer, weight_quant_params=wq_params,
+            act_quant_params=aq_params, act_quant_mode="qdiff", sm_abit=opt.sm_abit)
         qnn.to(device)
         qnn.eval()
+        log(f"  QuantModel built in {elapsed(t_qnn)}")
+
+        # Count quantizable layers
+        n_quant_layers = sum(1 for m in qnn.modules() if isinstance(m, QuantModule))
+        n_quant_blocks = sum(1 for m in qnn.modules() if isinstance(m, BaseQuantBlock))
+        log(f"  Quantizable layers  →  {n_quant_layers}")
+        log(f"  Quantizable blocks  →  {n_quant_blocks}")
+        log_gpu("after QuantModel build")
 
         if opt.no_grad_ckpt:
-            logger.info('Not use gradient checkpointing for transformer blocks')
+            log("  Gradient checkpointing disabled")
             qnn.set_grad_ckpt(False)
 
-        if opt.resume:
-            #noisy_latents = torch.randn(1, 4, 64, 64, dtype=torch.float16) #.cuda()
-            #timesteps = torch.zeros(1).long() #.cuda()
-            #class_labels = torch.tensor(list(range(1))) #.cuda()
-            #cali_data = (noisy_latents, timesteps, class_labels)
-            sample_data = torch.load(opt.cali_data_path)
-            cali_data = get_train_samples_custom(opt, sample_data, opt.ddim_steps)
-            resume_cali_model(
-                qnn, opt.cali_ckpt, cali_data, enable_act_quant, "qdiff",
-                cond=opt.cond, weight_quant=enable_weight_quant
-            )
-        else:
-            logger.info(f"Sampling data from {opt.cali_st} timesteps for calibration")
-            
-            sample_data = torch.load(opt.cali_data_path)  # This is de-commented when needed
-        
-            # [step, batch_size * 2, in_channel, height, width] of the noise latent image
-            #noisy_latents = torch.randn(opt.ddim_steps, 32, 4, 64, 64, dtype=torch.float16) #.cuda()
-            #timesteps = torch.zeros(opt.ddim_steps, 32).long() #.cuda()
-            #class_labels = torch.zeros(opt.ddim_steps, 32, 120, 4096) #.cuda()
-            #sample_data = {'xs': noisy_latents, #[2, 4, 64, 64]
-            #            'ts': timesteps,
-            #            'cs': class_labels} #[2, 120, 4096]
+        # ── 3a. Load calibration data ─────────────────────────────────────────
+        log("")
+        log("  Loading calibration data...")
+        t_cali = time.time()
+        sample_data = torch.load(opt.cali_data_path)
+        log(f"    xs shape   →  {tuple(sample_data['xs'].shape)}")
+        log(f"    ts shape   →  {tuple(sample_data['ts'].shape)}")
+        log(f"    cs shape   →  {tuple(sample_data['cs'].shape)}")
+        log(f"    ucs shape  →  {tuple(sample_data['ucs'].shape)}")
+        log(f"    ts unique  →  {sample_data['ts'][:,0].unique().tolist()}")
 
+        if opt.resume:
+            cali_data = get_train_samples_custom(opt, sample_data, opt.ddim_steps)
+            log(f"  Resuming from checkpoint: {opt.cali_ckpt}")
+            resume_cali_model(qnn, opt.cali_ckpt, cali_data, opt.quant_act, "qdiff", cond=opt.cond, weight_quant=enable_weight_quant)
+        else:
+            log(f"  Casting xs, cs to float16...")
             sample_data['xs'] = sample_data['xs'].to(torch.float16)
             sample_data['cs'] = sample_data['cs'].to(torch.float16)
             cali_data = get_train_samples_custom(opt, sample_data, opt.ddim_steps)
-            del(sample_data)
+            del sample_data
             gc.collect()
-            logger.info(f"Calibration data shape: {cali_data[0].shape} {cali_data[1].shape} {cali_data[2].shape}")
 
             cali_xs, cali_ts, cali_cs = cali_data
+            log(f"  cali_xs shape  →  {tuple(cali_xs.shape)}  dtype={cali_xs.dtype}")
+            log(f"  cali_ts shape  →  {tuple(cali_ts.shape)}  unique={cali_ts.unique().tolist()}")
+            log(f"  cali_cs shape  →  {tuple(cali_cs.shape)}  dtype={cali_cs.dtype}")
+            log(f"  Calibration data loaded in {elapsed(t_cali)}")
+
             if opt.resume_w:
-                resume_cali_model(
-                    qnn, opt.cali_ckpt, cali_data, False,
-                    cond=opt.cond, weight_quant=enable_weight_quant
-                )
+                log(f"  Resuming weights from: {opt.cali_ckpt}")
+                if opt.gptq:
+                    # GPTQ checkpoints contain only model weights (already
+                    # quantized in-place by fasterquant). They do NOT contain
+                    # AdaRound quantizer params (alpha/zero_point/delta).
+                    # Load directly with strict=False — no AdaRound conversion.
+                    log("  GPTQ resume: loading checkpoint directly (no AdaRound)")
+                    ckpt = torch.load(opt.cali_ckpt, map_location='cpu')
+                    missing, unexpected = qnn.load_state_dict(ckpt, strict=False)
+                    log(f"    Loaded: {len(ckpt)} keys  "
+                        f"missing={len(missing)}  unexpected={len(unexpected)}")
+                    if missing:
+                        log(f"    Missing (first 5): {missing[:5]}")
+                    if unexpected:
+                        log(f"    Unexpected (first 5): {unexpected[:5]}")
+                    del ckpt
+                    # Sync org_weight with loaded weights for QuantModules
+                    for m in qnn.modules():
+                        if isinstance(m, QuantModule) and hasattr(m, 'org_weight'):
+                            m.org_weight = m.weight.data.clone()
+                    log("  GPTQ resume complete — weights loaded")
+                else:
+                    resume_cali_model(qnn, opt.cali_ckpt, cali_data, False, cond=opt.cond, weight_quant=enable_weight_quant)
+                log("  resume_w: skipping init forward pass and calibration")
             else:
                 if enable_weight_quant:
                     logger.info("Initializing weight quantization parameters")
                 else:
                     logger.info("Skipping weight quantization; activations will be calibrated against FP16/BF16 weights")
 
-            qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=False)
+                # ── Cali data stays on CPU throughout ─────────────────────────
+                # cali_xs alone is ~10.5 GB and cali_cs ~5 GB. Moving them to GPU
+                # all at once causes a silent CUDA OOM deadlock. We keep everything
+                # on CPU and .to(device) only the small slices we need per operation.
+                xs_gb = cali_xs.element_size() * cali_xs.numel() / 1024**3
+                cs_gb = cali_cs.element_size() * cali_cs.numel() / 1024**3
+                log(f"  Cali data staying on CPU:")
+                log(f"    cali_xs: {tuple(cali_xs.shape)}  {xs_gb:.2f} GB")
+                log(f"    cali_cs: {tuple(cali_cs.shape)}  {cs_gb:.2f} GB")
+                log(f"    total: {xs_gb + cs_gb:.2f} GB  — NOT moving to GPU")
+                log_gpu("before init forward pass")
 
-            #print(qnn)
-            cali_xs = cali_xs.to(device)
-            cali_ts = cali_ts.to(device)
-            cali_cs = cali_cs.to(device)
-            _ = qnn(
-                cali_xs[:2],
-                timestep=cali_ts[:2],
-                encoder_hidden_states=cali_cs[:2],
-                added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[:2]),
-            )
-            logger.info("Initializing has done!")
+                # Weight quant init forward pass — only 2 samples needed to
+                # initialize UAQ delta/zero_point for every QuantModule.
+                #
+                # IMPORTANT: temporarily override scale_method to 'max' for this
+                # init pass. The configured method (e.g. 'mse') runs a 100-point
+                # grid search per layer group during the first forward pass, which
+                # for 287 layers × (weight_cols / group_size) groups can take
+                # 10-30 minutes and appears as a hang. 'max' is O(1) and just
+                # needs to create correctly-shaped delta/zero_point tensors.
+                # The actual MSE-optimal scales are found during BRECQ/GPTQ anyway.
+                n_overridden = 0
+                for m in qnn.modules():
+                    if hasattr(m, 'weight_quantizer') and hasattr(m.weight_quantizer, 'scale_method'):
+                        m.weight_quantizer.scale_method = 'max'
+                        n_overridden += 1
+                log(f"  Overrode scale_method → 'max' on {n_overridden} weight quantizers")
+                log(f"  (will restore to '{opt.weight_quant_method}' after init pass)")
 
-            # TODO adjust some things here
-            kwargs = dict(cali_data=cali_data, batch_size=opt.cali_batch_size, 
-                    iters=opt.cali_iters, weight=0.01, asym=True, b_range=(20, 2),
-                    warmup=0.2, act_quant=False, opt_mode='mse', cond=opt.cond, sequential=opt.sequential_w,
-                    no_adaround=opt.no_adaround, multi_gpu=use_ddp, weight_quant=enable_weight_quant)
-        
-            def recon_model(model):
-                """
-                Block reconstruction. For the first and last layers, we can only apply layer reconstruction.
-                """
+                qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=False)
+                log(f"  Moving 2 samples to {device} and running forward pass...")
+                t_init = time.time()
+                with torch.no_grad():
+                    _xs2 = cali_xs[:2].to(device)
+                    _ts2 = cali_ts[:2].to(device)
+                    _cs2 = cali_cs[:2].to(device)
+                    log(f"    xs2={tuple(_xs2.shape)} dtype={_xs2.dtype}  "
+                        f"ts2={tuple(_ts2.shape)}  cs2={tuple(_cs2.shape)}")
+                    _ = qnn(
+                        _xs2,
+                        timestep=_ts2,
+                        encoder_hidden_states=_cs2,
+                        added_cond_kwargs=pixart_alpha_aca_dict(_xs2),
+                    )
+                    del _xs2, _ts2, _cs2
+                torch.cuda.empty_cache()
+                log(f"  Init forward pass done in {elapsed(t_init)}")
+                log_gpu("after init forward pass")
+
+                # Count how many quantizers were actually initialized
+                n_inited = sum(
+                    1 for m in qnn.modules()
+                    if hasattr(m, 'weight_quantizer')
+                    and hasattr(m.weight_quantizer, 'inited')
+                    and m.weight_quantizer.inited
+                )
+                log(f"  Weight quantizers initialized: {n_inited}/{n_overridden}")
+
+                # ── Restore configured scale_method for BRECQ/GPTQ ───────────
+                real_scale_method = opt.weight_quant_method
+                n_restored = 0
+                for m in qnn.modules():
+                    if hasattr(m, 'weight_quantizer') and hasattr(m.weight_quantizer, 'scale_method'):
+                        m.weight_quantizer.scale_method = real_scale_method
+                        m.weight_quantizer.inited = False  # force re-init with correct method
+                        n_restored += 1
+                log(f"  Restored scale_method → '{real_scale_method}' on {n_restored} quantizers")
+                log(f"  inited=False reset so GPTQ/BRECQ will recompute with '{real_scale_method}'")
+
+            kwargs = dict(
+                cali_data=cali_data, batch_size=opt.cali_batch_size,
+                iters=opt.cali_iters, weight=0.01, asym=True, b_range=(20, 2),
+                warmup=0.2, act_quant=False, opt_mode='mse', cond=opt.cond,
+                sequential=opt.sequential_w, no_adaround=opt.no_adaround, multi_gpu=False, weight_quant=enable_weight_quant)
+
+            def recon_model(model, depth=0):
+                """Recursive block/layer reconstruction with per-module logging."""
+                indent = "  " * depth
                 for name, module in model.named_children():
-                    logger.info(f"{name} {isinstance(module, BaseQuantBlock)}")
-                    """
-                    if name == 'output_blocks':
-                        logger.info("Finished calibrating input and mid blocks, saving temporary checkpoint...")
-                        in_recon_done = True
-                        torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
-                    if name.isdigit() and int(name) >= 9:
-                        logger.info(f"Saving temporary checkpoint at {name}...")
-                        torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
-                    """
                     if isinstance(module, QuantModule):
-                        if module.ignore_reconstruction is True:
-                            logger.info('Ignore reconstruction of layer {}'.format(name))
+                        if module.ignore_reconstruction:
+                            log(f"{indent}  SKIP layer: {name}")
                             continue
-                        else:
-                            logger.info('Reconstruction for layer {}'.format(name))
-                            layer_reconstruction(qnn, module, **kwargs)
+                        log(f"{indent}  RECON layer: {name}")
+                        t_r = time.time()
+                        layer_reconstruction(qnn, module, **kwargs)
+                        log(f"{indent}    done in {elapsed(t_r)}")
                     elif isinstance(module, BaseQuantBlock):
-                        if module.ignore_reconstruction is True:
-                            logger.info('Ignore reconstruction of block {}'.format(name))
+                        if module.ignore_reconstruction:
+                            log(f"{indent}  SKIP block: {name}")
                             continue
-                        else:
-                            logger.info('Reconstruction for block {}'.format(name))
-                            block_reconstruction(qnn, module, **kwargs)
+                        log(f"{indent}  RECON block: {name}")
+                        t_r = time.time()
+                        block_reconstruction(qnn, module, **kwargs)
+                        log(f"{indent}    done in {elapsed(t_r)}")
                     else:
-                        recon_model(module)
+                        recon_model(module, depth + 1)
 
+            # ── 3b. GPTQ ──────────────────────────────────────────────────────
+            if opt.gptq and not opt.resume_w:
+                from qdiff.gptq import GPTQ
+                log("")
+                log("─" * 60)
+                log("STEP 3b  GPTQ calibration")
+                log("  NOTE: BRECQ (recon_model) is SKIPPED — --gptq is set")
+                log(f"  gptq_percdamp={opt.gptq_percdamp}  "
+                    f"gptq_groupsize={opt.gptq_groupsize}  "
+                    f"gptq_blocksize={opt.gptq_blocksize}")
+                t_gptq = time.time()
+
+                # Build block groups for GPTQ.
+                # Strategy: each transformer_blocks.N is one group (10-11 layers).
+                # Each non-transformer-block QuantModule is its OWN group —
+                # the old code used parts[0]="model" for all of them, collapsing
+                # pos_embed, proj_out, adaln_single, caption_projection into one
+                # massive group with ALL 287 layers, which:
+                #   (a) attaches hooks to every layer for every group's forward pass
+                #   (b) builds Hessians simultaneously for unrelated layers
+                #   (c) holds all Hessians in VRAM at the same time
+                # Correct behavior: each group should share a forward pass because
+                # only layers active during that pass can accumulate Hessian signal.
+                block_names = []
+                seen = set()
+                for name, module in qnn.named_modules():
+                    if not isinstance(module, QuantModule) or module.ignore_reconstruction:
+                        continue
+                    parts = name.split(".")
+                    if "transformer_blocks" in parts:
+                        # e.g. model.transformer_blocks.0.attn1.to_q → group: model.transformer_blocks.0
+                        tb_idx = parts.index("transformer_blocks")
+                        root = ".".join(parts[:tb_idx + 2])  # includes the block number
+                    else:
+                        # Non-transformer-block layers: each is its own group.
+                        # e.g. model.pos_embed.proj, model.proj_out, model.adaln_single.linear
+                        # Use the full module name so each gets processed independently.
+                        root = name
+                    if root not in seen:
+                        seen.add(root)
+                        block_names.append(root)
+
+                log(f"  Total block groups to quantize: {len(block_names)}")
+                for bn in block_names:
+                    log(f"    {bn}")
+
+                for blk_idx, block_name in enumerate(block_names):
+                    t_blk = time.time()
+                    log(f"\n  Block group [{blk_idx+1}/{len(block_names)}]: {block_name}")
+
+                    # Match layers belonging to this block group.
+                    # Use exact prefix with dot boundary to avoid e.g.
+                    # "model.pos_embed.proj" matching "model.pos_embed.proj_out"
+                    subset_layers = {
+                        name: module
+                        for name, module in qnn.named_modules()
+                        if (name == block_name or name.startswith(block_name + "."))
+                        and isinstance(module, QuantModule)
+                        and not module.ignore_reconstruction
+                    }
+                    if not subset_layers:
+                        log(f"    No QuantModules found — skipping")
+                        continue
+
+                    log(f"    Layers in this block: {len(subset_layers)}")
+                    for ln in subset_layers:
+                        log(f"      {ln}")
+
+                    # BUG FIX: guard against zero samples before fasterquant
+                    gptqs = {}
+                    handles = []
+                    for name, module in subset_layers.items():
+                        g = GPTQ(module)
+                        g.quantizer = module.weight_quantizer
+                        gptqs[name] = g
+
+                        def add_batch(n):
+                            def tmp(_, inp, out):
+                                # BUG FIX: guard nsamples==0 in gptq.add_batch
+                                gptqs[n].add_batch(inp[0].data, out.data)
+                            return tmp
+                        handles.append(module.register_forward_hook(add_batch(name)))
+
+                    # Cap Hessian samples at gptq_cali_n.
+                    # GPTQ is not sensitive to sample count past ~128-256.
+                    # Using the full cali set (e.g. 5120) makes collection
+                    # 20-40x slower with negligible accuracy improvement.
+                    # n_total = min(cali_xs.size(0), opt.gptq_cali_n)
+                    n_total = cali_xs.size(0)
+                    bs = opt.cali_batch_size
+                    n_passes = (n_total + bs - 1) // bs
+                    log(f"    Collecting Hessians: {n_total}/{cali_xs.size(0)} samples  "
+                        f"batch={bs}  ({n_passes} passes)  "
+                        f"[capped by --gptq_cali_n={opt.gptq_cali_n}]")
+                    # CRITICAL: disable weight quantization during Hessian
+                    # collection. GPTQ only needs the input activations — the
+                    # hooks capture inp before any weight interaction. Running
+                    # with weight_quant=True and group_quant=True makes every
+                    # forward pass ~270x slower (543s for 2 samples vs ~2s fp16).
+                    # With weight_quant=False, 16 passes × ~2s = ~32s total.
+                    qnn.set_quant_state(weight_quant=False, act_quant=False)
+                    t_hess = time.time()
+                    qnn.eval()
+                    with torch.no_grad():
+                        for i in range(0, n_total, bs):
+                            _xs = cali_xs[i:i+bs].to(device)
+                            _ts = cali_ts[i:i+bs].to(device)
+                            _cs = cali_cs[i:i+bs].to(device)
+                            _ = qnn(
+                                _xs,
+                                timestep=_ts,
+                                encoder_hidden_states=_cs,
+                                added_cond_kwargs=pixart_alpha_aca_dict(_xs)
+                            )
+                            del _xs, _ts, _cs
+                    # Restore weight quant state for fasterquant
+                    qnn.set_quant_state(weight_quant=True, act_quant=False)
+                    log(f"    Hessian collection done in {elapsed(t_hess)}")
+
+                    for h in handles:
+                        h.remove()
+
+                    # BUG FIX: check nsamples before quantizing
+                    for name, gptq in gptqs.items():
+                        if gptq.nsamples == 0:
+                            log(f"    WARNING: {name} collected 0 samples — skipping", "warning")
+                            continue
+                        log(f"    Quantizing {name}  (nsamples={gptq.nsamples})...")
+                        t_q = time.time()
+                        gptq.fasterquant(
+                            percdamp=opt.gptq_percdamp,
+                            groupsize=opt.gptq_groupsize,
+                            blocksize=opt.gptq_blocksize
+                        )
+                        gptq.free()
+                        log(f"      done in {elapsed(t_q)}")
+
+                    log(f"    Block group done in {elapsed(t_blk)}")
+                    log_gpu(f"after block {blk_idx+1}")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
+                log(f"\n  GPTQ calibration complete in {elapsed(t_gptq)}")
+                log_gpu("after full GPTQ")
+
+            # ── 3c. BRECQ ─────────────────────────────────────────────────────
             if enable_weight_quant and not opt.resume_w:
-                logger.info("Doing weight calibration")
-                recon_model(qnn)
+                if not opt.gptq:
+                    log("")
+                    log("─" * 60)
+                    log(f"STEP 3c  BRECQ weight calibration "
+                        f"(iters={opt.cali_iters}, batch={opt.cali_batch_size})...")
+                    t_brecq = time.time()
+                    recon_model(qnn)
+                    log(f"  BRECQ complete in {elapsed(t_brecq)}")
+                    log_gpu("after BRECQ")
+
                 qnn.set_quant_state(weight_quant=True, act_quant=False)
-                if use_ddp:
-                    dist.barrier()
-                # NOTE Checkpoint weight quantization calibation separately
-                logger.info("Saving calibrated quantized UNet model")
+
+                log("")
+                log("  Saving weight-quantized checkpoint...")
+                t_save = time.time()
                 for m in qnn.model.modules():
                     if isinstance(m, AdaRoundQuantizer):
                         m.zero_point = nn.Parameter(m.zero_point)
                         m.delta = nn.Parameter(m.delta)
-                    elif isinstance(m, UniformAffineQuantizer) and enable_act_quant:
+                    elif isinstance(m, UniformAffineQuantizer) and enable_act_quant and opt.quant_act:
                         if m.zero_point is not None:
                             if not torch.is_tensor(m.zero_point):
                                 m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                             else:
                                 m.zero_point = nn.Parameter(m.zero_point)
-                if is_main_process:
-                    torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt_wq.pth"))
-                logger.info(model.transformer)
+
+                ckpt_path = os.path.join(outpath, "ckpt_wq.pth")
+                torch.save(qnn.state_dict(), ckpt_path)
+                ckpt_mb = os.path.getsize(ckpt_path) / 1024**2
+                log(f"  Saved weight checkpoint: {ckpt_path} ({ckpt_mb:.1f} MB) in {elapsed(t_save)}")
+
+            # ── 3d. Activation calibration ────────────────────────────────────
             if enable_act_quant and opt.disable_online_act_quant:
-                logger.info("UNet model")
-                logger.info(model.transformer)                    
-                logger.info("Doing activation calibration")
-                # Initialize activation quantization parameters
+                # FIX 3: loud warning if cali_iters_a too low
+                if opt.cali_iters_a < 100:
+                    log(f"  WARNING: cali_iters_a={opt.cali_iters_a} — "
+                        "activation calibration effectively disabled!", "warning")
+
+                log("")
+                log("─" * 60)
+                log(f"STEP 3d  Activation calibration (iters={opt.cali_iters_a})...")
+                t_act = time.time()
+
                 qnn.set_quant_state(enable_weight_quant, True)
+                log("  Init activation quantizers with 16 random samples...")
                 with torch.no_grad():
                     inds = np.random.choice(cali_xs.shape[0], 16, replace=False)
+                    log(f"    sample indices: {inds.tolist()}")
+                    _xs = cali_xs[inds].to(device)
+                    _ts = cali_ts[inds].to(device)
+                    _cs = cali_cs[inds].to(device)
                     _ = qnn(
-                        cali_xs[inds],
-                        timestep=cali_ts[inds],
-                        encoder_hidden_states=cali_cs[inds],
-                        added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[inds]),
+                        _xs, timestep=_ts, encoder_hidden_states=_cs,
+                        added_cond_kwargs=pixart_alpha_aca_dict(_xs),
                     )
-                    if opt.running_stat:
-                        logger.info('Running stat for activation quantization')
-                        inds = np.arange(cali_xs.shape[0])
-                        np.random.shuffle(inds)
-                        qnn.set_running_stat(True, opt.rs_sm_only)
-                        for i in trange(int(cali_xs.size(0) / 16), disable=opt.nvtx_profile):
-                            _ = qnn(
-                                cali_xs[inds[i * 16:(i + 1) * 16]],
-                                timestep=cali_ts[inds[i * 16:(i + 1) * 16]],
-                                encoder_hidden_states=cali_cs[inds[i * 16:(i + 1) * 16]],
-                                added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[inds[i * 16:(i + 1) * 16]]),
-                            )
-                        qnn.set_running_stat(False, opt.rs_sm_only)
+                    del _xs, _ts, _cs
+                log("  Activation init done")
 
-                # TODO change these guys too.
-                kwargs = dict(
-                    cali_data=cali_data, batch_size=opt.cali_batch_size, iters=opt.cali_iters_a, act_quant=True, 
-                    opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p, cond=opt.cond,
-                    sequential=opt.sequential_a, multi_gpu=use_ddp, weight_quant=enable_weight_quant)
+                if opt.running_stat:
+                    log("  Running statistics collection for activation quantizers...")
+                    t_rs = time.time()
+                    inds = np.arange(cali_xs.shape[0])
+                    np.random.shuffle(inds)
+                    qnn.set_running_stat(True, opt.rs_sm_only)
+                    n_batches = int(cali_xs.size(0) / 16)
+                    for i in trange(n_batches, desc="running_stat", disable=(rank != 0 or opt.nvtx_profile)):
+                        sl = inds[i*16:(i+1)*16]
+                        _xs = cali_xs[sl].to(device)
+                        _ts = cali_ts[sl].to(device)
+                        _cs = cali_cs[sl].to(device)
+                        _ = qnn(
+                            _xs, timestep=_ts, encoder_hidden_states=_cs,
+                            added_cond_kwargs=pixart_alpha_aca_dict(_xs),
+                        )
+                        del _xs, _ts, _cs
+                    qnn.set_running_stat(False, opt.rs_sm_only)
+                    log(f"  Running stat done in {elapsed(t_rs)}")
+
+                kwargs_a = dict(
+                    cali_data=cali_data, batch_size=opt.cali_batch_size,
+                    iters=opt.cali_iters_a, act_quant=True,
+                    opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p,
+                    cond=opt.cond, sequential=opt.sequential_a, multi_gpu=False, weight_quant=enable_weight_quant)
                 recon_model(qnn)
                 qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=True)
+                log(f"  Activation calibration done in {elapsed(t_act)}")
+                log_gpu("after act calibration")
+
             elif enable_act_quant:
-                # To be implement
-                logger.info("Doing online activation calibration")
+                log("  Online activation calibration mode (no LSQ)")
                 qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=True)
-            # Currently, this does not work
-            """
-            print("Report delta change")
-            for n, m in qnn.named_modules():
-                if isinstance(m, QuantModule):
-                    m.report_delta_shift()
-            """
-            
-            logger.info("Saving calibrated quantized UNet model")
+
+            # Final checkpoint save
+            log("")
+            log("  Saving final quantized model checkpoint...")
+            t_save = time.time()
             for m in qnn.model.modules():
                 if isinstance(m, AdaRoundQuantizer):
                     m.zero_point = nn.Parameter(m.zero_point)
@@ -850,121 +963,106 @@ def main():
                             m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                         else:
                             m.zero_point = nn.Parameter(m.zero_point)
-            #torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
+
+        # After GPTQ, weights are already quantized in-place — disable the
+        # weight quantizer to avoid double-quantization and shape mismatches.
+        if opt.gptq:
+            log("  GPTQ path: disabling weight quantizer for inference "
+                "(weights already quantized in-place)")
+            qnn.set_quant_state(weight_quant=False, act_quant=opt.quant_act)
 
         qnn = qnn.to(device=device, dtype=torch.float16)
+        # org_weight / org_bias are plain tensor attrs (not Parameters/buffers)
+        # so .to() doesn't move them. Move them explicitly.
+        for m in qnn.modules():
+            if isinstance(m, QuantModule):
+                if hasattr(m, 'org_weight') and m.org_weight is not None:
+                    m.org_weight = m.org_weight.to(device=device, dtype=torch.float16)
+                if hasattr(m, 'org_bias') and m.org_bias is not None:
+                    m.org_bias = m.org_bias.to(device=device, dtype=torch.float16)
         model.transformer = qnn
-
+        log(f"  Quantized transformer attached to pipeline in {elapsed(t0)}")
+        log_gpu("after full PTQ")
     if opt.nvtx_profile:
         suppress_quant_module_prints(model.transformer)
-
     step_tracker = install_nvtx_instrumentation(model, opt.nvtx_profile)
-    
-    #model.text_encoder = model.text_encoder.to("cuda")
 
-    if use_ddp:
-        dist.barrier()
+    # ── 4. Sampling ───────────────────────────────────────────────────────────
+    log("")
+    log("─" * 60)
+    log("STEP 4  Sampling images...")
+    t_sample = time.time()
 
-    if do_parallel_generate:
-        sample_path = os.path.join(outpath, sp)
-        if is_main_process:
-            os.makedirs(sample_path, exist_ok=True)
-            sampling_file = os.path.join(outpath, "sampling_config.yaml")
-            sampling_conf = vars(opt)
-            with open(sampling_file, 'a+') as f:
-                yaml.dump(sampling_conf, f, default_flow_style=False)
-        dist.barrier()
+    # Older diffusers versions have a broken _execution_device property that
+    # raises AttributeError. Override it on the class with a working version.
+    try:
+        _ = model._execution_device
+    except AttributeError:
+        type(model)._execution_device = property(lambda self: device)
+        log(f"  Patched _execution_device → {device}")
 
-        batch_size = opt.n_samples
-        npe = npe.to(device)
-        npam = npam.to(device)
-        total = pes.shape[0]
-        local_indices = list(range(rank, total, world_size))
-        for start in tqdm(
-            range(0, len(local_indices), batch_size),
-            desc=f"rank{rank}-data",
-            disable=(rank != 0 or opt.nvtx_profile),
-        ):
+    sample_path = os.path.join(outpath, sp)
+    os.makedirs(sample_path, exist_ok=True)
+    base_count = len(os.listdir(sample_path))
+    grid_count = len(os.listdir(outpath)) - 1
+
+    sampling_file = os.path.join(outpath, "sampling_config.yaml")
+    sampling_conf = vars(opt)
+    with open(sampling_file, 'a+') as f:
+        yaml.dump(sampling_conf, f, default_flow_style=False)
+
+    if opt.verbose:
+        log("Transformer architecture:")
+        logger.info(model.transformer)
+
+    batch_size = opt.n_samples
+    if opt.prompt is None:
+        n_total = pes.shape[0]
+        n_batches = (n_total + batch_size - 1) // batch_size
+        log(f"  Generating {n_total} images in {n_batches} batches of {batch_size}...")
+        for i in tqdm(range(0, pes.shape[0], batch_size), desc="sampling", disable=opt.nvtx_profile):
             torch.manual_seed(42)
-            batch_idx = local_indices[start:start + batch_size]
-            prompt_embeds = pes[batch_idx].to(device)
-            image = run_generation(
+            prompt_embeds = pes[i:i + batch_size].to(device)
+            t_img = time.time()
+            image = run_generation( 
                 model,
                 step_tracker,
                 opt.nvtx_profile,
-                prompt=None,
-                negative_prompt=None,
+                prompt=None, negative_prompt=None,
                 prompt_embeds=prompt_embeds,
-                prompt_attention_mask=pams[batch_idx].to(device),
+                prompt_attention_mask=pams[i:i + batch_size].to(device),
                 negative_prompt_embeds=npe.expand(prompt_embeds.shape[0], -1, -1),
                 negative_prompt_attention_mask=npam.expand(prompt_embeds.shape[0], -1),
-                height=opt.res,
-                width=opt.res,
+                height=opt.res, width=opt.res
             ).images
-
             for j, img in enumerate(image):
-                img.save(os.path.join(sample_path, f"{batch_idx[j]}.png"))
-        dist.barrier()
-        if is_main_process:
-            logging.info(f"Parallel generation complete. Samples are in:\n{outpath}")
-    elif is_main_process:
-        sample_path = os.path.join(outpath, sp)
-        os.makedirs(sample_path, exist_ok=True)
-        base_count = len(os.listdir(sample_path))
-        grid_count = len(os.listdir(outpath)) - 1
-
-        # write config out
-        sampling_file = os.path.join(outpath, "sampling_config.yaml")
-        sampling_conf = vars(opt)
-        with open(sampling_file, 'a+') as f:
-            yaml.dump(sampling_conf, f, default_flow_style=False)
-        if opt.verbose:
-            logger.info("UNet model")
-            logger.info(model.model)
-
-        #start_code = None
-        #if opt.fixed_code:
-        #    start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
-        batch_size = opt.n_samples
-        if opt.prompt is None:
-            for i in tqdm(range(0, pes.shape[0], batch_size), desc="data", disable=opt.nvtx_profile):
-                torch.manual_seed(42) # Meaning of Life, the Universe and Everything
-                prompt_embeds = pes[i:i + batch_size].to(device)
-                image = run_generation(
-                    model,
-                    step_tracker,
-                    opt.nvtx_profile,
-                    prompt=None,
-                    negative_prompt=None,
-                    prompt_embeds=prompt_embeds,
-                    prompt_attention_mask=pams[i:i + batch_size].to(device),
-                    negative_prompt_embeds=npe.expand(prompt_embeds.shape[0], -1, -1),
-                    negative_prompt_attention_mask=npam.expand(prompt_embeds.shape[0], -1),
-                    height=opt.res,
-                    width=opt.res,
-                ).images
-
-                for j, img in enumerate(image):
-                    img.save(os.path.join(sample_path, f"{i+j}.png"))
-        else:
-            torch.manual_seed(42) # Meaning of Life, the Universe and Everything
-            prompt = [opt.prompt]
-            image = run_generation(
+                img.save(os.path.join(sample_path, f"{i+j}.png"))
+            if i == 0:
+                log(f"  First batch generated in {elapsed(t_img)}  "
+                    f"→  {os.path.join(sample_path, '0.png')}")
+    else:
+        torch.manual_seed(42)
+        log(f"  Prompt: '{opt.prompt}'")
+        image = run_generation(
                 model,
                 step_tracker,
                 opt.nvtx_profile,
-                prompt=prompt,
+                prompt=opt.prompt,
                 height=opt.res,
                 width=opt.res,
             ).images
 
-            for j, img in enumerate(image):
-                img.save(os.path.join(sample_path, f"{j}.png"))
+        for j, img in enumerate(image):
+            out_path = os.path.join(sample_path, f"{j}.png")
+            img.save(out_path)
+            log(f"  Saved: {out_path}")
 
-        logging.info(f"Your samples are ready and waiting for you here: \n{outpath} \n"
-              f" \nEnjoy.")
-
-    finalize_parallel(use_ddp)
+    log(f"  Sampling complete in {elapsed(t_sample)}")
+    log("")
+    log("=" * 70)
+    log(f"ALL DONE  —  total wall time: {elapsed(SCRIPT_START)}")
+    log(f"Outputs at: {outpath}")
+    log("=" * 70)
 
 
 if __name__ == "__main__":
