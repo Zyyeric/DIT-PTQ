@@ -68,21 +68,26 @@ echo ""
 # ── Run ───────────────────────────────────────────────────────────────────────
 echo "Starting FP4 BRECQ Calibration and Generation..."
 
-python scripts/pixart_alpha_brecq.py \\
-  --cond \\
-  --n_samples 1 \\
-  --res 512 \\
-  --coco_10k \\
-  --outdir "\${OUTDIR}" \\
-  --cali_data_path "\${CALI_DATA}" \\
-  --ptq \\
-  --quant_mode qdiff \\
-  --cali_batch_size 16 \\
-  --weight_bit 4 \\
-  --weight_group_size 128 \\
-  --quant_weight \\
-  --weight_quant_method mse \\
-  --cali_iters 20000
+python scripts/pixart_alpha_brecq.py \
+  --cond \
+  --n_samples 1 \
+  --res 512 \
+  --coco_10k \
+  --outdir "${OUTDIR}" \
+  --cali_data_path "${CALI_DATA}" \
+  --ptq \
+  --quant_mode qdiff \
+  --cali_batch_size 16 \
+  --weight_bit 4 \
+  --act_bit 8 \
+  --weight_group_size 128 \
+  --quant_weight \
+  --weight_quant_method mse \
+  --cali_iters 20000 \
+  --weight_mantissa_bits 1 \
+  --ff_weight_mantissa 0 \
+  --quant_act \
+  --act_mantissa_bits 4
 EXIT_CODE=\$?
 
 # ── Post-run summary ──────────────────────────────────────────────────────────

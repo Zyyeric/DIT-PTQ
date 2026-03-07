@@ -79,6 +79,7 @@ python scripts/pixart_alpha_brecq.py \\
   --quant_mode qdiff \\
   --cali_batch_size 16 \\
   --weight_bit 4 \\
+  --act_bit 8 \\
   --weight_group_size 128 \\
   --disable_fp_quant \\
   --gptq \\
@@ -86,7 +87,8 @@ python scripts/pixart_alpha_brecq.py \\
   --gptq_blocksize 128 \\
   --w_sym \\
   --w_clip_ratio 1.0 \\
-  --gptq_cali_n 256
+  --gptq_cali_n 256 \\
+  --quant_act
 EXIT_CODE=\$?
 
 # ── Post-run summary ──────────────────────────────────────────────────────────
