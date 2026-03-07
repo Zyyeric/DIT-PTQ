@@ -137,7 +137,7 @@ class UniformAffineQuantizer(nn.Module):
                         x, self.channel_wise, print_stats=True)
             self.inited = True
             logger.debug(f"UAQ inited: delta range=[{self.delta.min():.4e}, "
-                         f"{self.delta.max():.4e}]  zero_point={self.zero_point}")
+                         f"{self.delta.max().item():.4e}]  zero_point={self.zero_point}")
 
         if self.fp:
             if self.leaf_param and self.dynamic_idx is not None:

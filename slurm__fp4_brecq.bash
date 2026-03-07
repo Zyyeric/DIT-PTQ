@@ -21,7 +21,7 @@ sbatch <<EOF
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --gres=gpu:a100:1
 #SBATCH --partition=gengpu
 #SBATCH --account=e33188
