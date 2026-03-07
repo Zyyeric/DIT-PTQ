@@ -19,6 +19,14 @@ from qdiff import (
     QuantModel, QuantModule, BaseQuantBlock,
     block_reconstruction, layer_reconstruction,
 )
+from qdiff.nvtx import (
+    DenoisingStepTracker,
+    nvtx_range,
+    wrap_module_forward,
+    wrap_named_modules_by_predicate,
+    wrap_named_modules_by_suffix,
+    wrap_object_method,
+)
 from qdiff.adaptive_rounding import AdaRoundQuantizer
 from qdiff.quant_layer import UniformAffineQuantizer
 from qdiff.utils import resume_cali_model, get_train_samples_custom, convert_adaround, pixart_alpha_aca_dict, save_inp_oup_data
@@ -58,7 +66,24 @@ safety_model_id = "CompVis/stable-diffusion-safety-checker"
 safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
 safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
+LEAF_NVTX_SUFFIXES = {
+    ".attn1.to_out.0": "attn1.to_out",
+    ".attn2.to_out.0": "attn2.to_out",
+    ".ff.net.0.proj": "ff.net.0.proj",
+    ".attn1.to_q": "attn1.to_q",
+    ".attn1.to_k": "attn1.to_k",
+    ".attn1.to_v": "attn1.to_v",
+    ".attn2.to_q": "attn2.to_q",
+    ".attn2.to_k": "attn2.to_k",
+    ".attn2.to_v": "attn2.to_v",
+    ".ff.net.2": "ff.net.2",
+}
 
+PARENT_NVTX_SUFFIXES = {
+    ".attn1": "self_attn",
+    ".attn2": "cross_attn",
+    ".ff": "ffn",
+}
 def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
@@ -109,6 +134,67 @@ def suppress_quant_module_prints(module):
         if isinstance(submodule, QuantModule):
             submodule.run_prints = False
 
+rank = int(os.environ["RANK"])
+def install_nvtx_instrumentation(pipeline, enabled: bool):
+    step_tracker = DenoisingStepTracker()
+    if not enabled:
+        return step_tracker
+
+    wrap_object_method(pipeline, "encode_prompt", "encode_prompt", enabled=enabled)
+    wrap_object_method(pipeline, "prepare_latents", "prepare_latents", enabled=enabled)
+    wrap_object_method(pipeline, "run_safety_checker", "run_safety_checker", enabled=enabled)
+    if hasattr(pipeline, "image_processor") and pipeline.image_processor is not None:
+        wrap_object_method(pipeline.image_processor, "postprocess", "image_postprocess", enabled=enabled)
+    if hasattr(pipeline, "vae") and pipeline.vae is not None:
+        wrap_object_method(pipeline.vae, "decode", "vae_decode", enabled=enabled)
+
+    transformer = pipeline.transformer
+    wrap_module_forward(
+        transformer,
+        "transformer_forward",
+        enabled=enabled,
+    )
+    wrap_named_modules_by_predicate(
+        transformer,
+        is_transformer_block,
+        "block",
+        enabled=enabled,
+    )
+    wrap_named_modules_by_suffix(
+        transformer,
+        PARENT_NVTX_SUFFIXES,
+        enabled=enabled,
+    )
+    wrap_named_modules_by_suffix(
+        transformer,
+        LEAF_NVTX_SUFFIXES,
+        enabled=enabled,
+    )
+
+    scheduler = pipeline.scheduler
+    wrap_object_method(scheduler, "set_timesteps", "set_timesteps", enabled=enabled)
+    original_scale_model_input = scheduler.scale_model_input
+    original_scheduler_step = scheduler.step
+
+    def wrapped_scale_model_input(*args, **kwargs):
+        step_tracker.begin_step(enabled=enabled)
+        with nvtx_range("scheduler_scale_model_input", enabled=enabled):
+            return original_scale_model_input(*args, **kwargs)
+
+    def wrapped_scheduler_step(*args, **kwargs):
+        try:
+            with nvtx_range("scheduler_step", enabled=enabled):
+                return original_scheduler_step(*args, **kwargs)
+        finally:
+            step_tracker.end_step(enabled=enabled)
+
+    scheduler.scale_model_input = wrapped_scale_model_input
+    scheduler.step = wrapped_scheduler_step
+    return step_tracker
+
+
+def is_transformer_block(name, module):
+    return all(hasattr(module, attr) for attr in ("attn1", "ff", "norm1"))
 
 def install_nvtx_instrumentation(pipeline, enabled: bool):
     step_tracker = DenoisingStepTracker()
@@ -175,7 +261,6 @@ def run_generation(pipeline, step_tracker: DenoisingStepTracker, enabled: bool, 
             return pipeline(**kwargs)
     finally:
         step_tracker.end_step(enabled=enabled)
-
 
 def main():
     SCRIPT_START = time.time()
@@ -260,6 +345,11 @@ def main():
     parser.add_argument("--gptq_percdamp", type=float, default=0.01)
     parser.add_argument("--gptq_groupsize", type=int, default=-1)
     parser.add_argument("--gptq_blocksize", type=int, default=128)
+    parser.add_argument(
+        "--nvtx_profile",
+        action="store_true",
+        help="Add NVTX ranges for generation, denoising steps, transformer blocks, attention, and FFN projections.",
+    )
     parser.add_argument("--gptq_cali_n", type=int, default=256,
                         help="Number of calibration samples for GPTQ Hessian collection. "
                              "128-256 is sufficient — GPTQ is not sensitive to sample count "
@@ -395,6 +485,15 @@ def main():
 
     # ── 3. Quantization ───────────────────────────────────────────────────────
     if opt.ptq:
+        if opt.weight_only and opt.act_only:
+            raise ValueError("--weight_only and --act_only are mutually exclusive")
+        if opt.resume_w and opt.act_only:
+            raise ValueError("--resume_w is only valid when weight quantization is enabled")
+
+        enable_weight_quant = not opt.act_only
+        enable_act_quant = opt.quant_act or opt.act_only
+        if opt.weight_only:
+            enable_act_quant = False
         log("")
         log("─" * 60)
         log("STEP 3  Setting up quantization...")
@@ -416,7 +515,7 @@ def main():
         aq_params = {
             'n_bits': opt.act_bit, 'channel_wise': False,
             'scale_method': opt.act_quant_method,
-            'leaf_param': opt.quant_act,
+            'leaf_param': enable_act_quant,
             'mantissa_bits': opt.act_mantissa_bits,
             'asym_softmax': opt.asym_softmax,
             'online_act_quant': (not opt.disable_online_act_quant),
@@ -466,7 +565,7 @@ def main():
         if opt.resume:
             cali_data = get_train_samples_custom(opt, sample_data, opt.ddim_steps)
             log(f"  Resuming from checkpoint: {opt.cali_ckpt}")
-            resume_cali_model(qnn, opt.cali_ckpt, cali_data, opt.quant_act, "qdiff", cond=opt.cond)
+            resume_cali_model(qnn, opt.cali_ckpt, cali_data, opt.quant_act, "qdiff", cond=opt.cond, weight_quant=enable_weight_quant)
         else:
             log(f"  Casting xs, cs to float16...")
             sample_data['xs'] = sample_data['xs'].to(torch.float16)
@@ -504,10 +603,13 @@ def main():
                             m.org_weight = m.weight.data.clone()
                     log("  GPTQ resume complete — weights loaded")
                 else:
-                    resume_cali_model(qnn, opt.cali_ckpt, cali_data, False, cond=opt.cond)
+                    resume_cali_model(qnn, opt.cali_ckpt, cali_data, False, cond=opt.cond, weight_quant=enable_weight_quant)
                 log("  resume_w: skipping init forward pass and calibration")
             else:
-                log("  Initializing weight quantization parameters...")
+                if enable_weight_quant:
+                    logger.info("Initializing weight quantization parameters")
+                else:
+                    logger.info("Skipping weight quantization; activations will be calibrated against FP16/BF16 weights")
 
                 # ── Cali data stays on CPU throughout ─────────────────────────
                 # cali_xs alone is ~10.5 GB and cali_cs ~5 GB. Moving them to GPU
@@ -539,7 +641,7 @@ def main():
                 log(f"  Overrode scale_method → 'max' on {n_overridden} weight quantizers")
                 log(f"  (will restore to '{opt.weight_quant_method}' after init pass)")
 
-                qnn.set_quant_state(weight_quant=True, act_quant=False)
+                qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=False)
                 log(f"  Moving 2 samples to {device} and running forward pass...")
                 t_init = time.time()
                 with torch.no_grad():
@@ -583,7 +685,7 @@ def main():
                 cali_data=cali_data, batch_size=opt.cali_batch_size,
                 iters=opt.cali_iters, weight=0.01, asym=True, b_range=(20, 2),
                 warmup=0.2, act_quant=False, opt_mode='mse', cond=opt.cond,
-                sequential=opt.sequential_w, no_adaround=opt.no_adaround, multi_gpu=False)
+                sequential=opt.sequential_w, no_adaround=opt.no_adaround, multi_gpu=False, weight_quant=enable_weight_quant)
 
             def recon_model(model, depth=0):
                 """Recursive block/layer reconstruction with per-module logging."""
@@ -754,7 +856,7 @@ def main():
                 log_gpu("after full GPTQ")
 
             # ── 3c. BRECQ ─────────────────────────────────────────────────────
-            if not opt.resume_w:
+            if enable_weight_quant and not opt.resume_w:
                 if not opt.gptq:
                     log("")
                     log("─" * 60)
@@ -774,7 +876,7 @@ def main():
                     if isinstance(m, AdaRoundQuantizer):
                         m.zero_point = nn.Parameter(m.zero_point)
                         m.delta = nn.Parameter(m.delta)
-                    elif isinstance(m, UniformAffineQuantizer) and opt.quant_act:
+                    elif isinstance(m, UniformAffineQuantizer) and enable_act_quant and opt.quant_act:
                         if m.zero_point is not None:
                             if not torch.is_tensor(m.zero_point):
                                 m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
@@ -787,7 +889,7 @@ def main():
                 log(f"  Saved weight checkpoint: {ckpt_path} ({ckpt_mb:.1f} MB) in {elapsed(t_save)}")
 
             # ── 3d. Activation calibration ────────────────────────────────────
-            if opt.quant_act and opt.disable_online_act_quant:
+            if enable_act_quant and opt.disable_online_act_quant:
                 # FIX 3: loud warning if cali_iters_a too low
                 if opt.cali_iters_a < 100:
                     log(f"  WARNING: cali_iters_a={opt.cali_iters_a} — "
@@ -798,7 +900,7 @@ def main():
                 log(f"STEP 3d  Activation calibration (iters={opt.cali_iters_a})...")
                 t_act = time.time()
 
-                qnn.set_quant_state(True, True)
+                qnn.set_quant_state(enable_weight_quant, True)
                 log("  Init activation quantizers with 16 random samples...")
                 with torch.no_grad():
                     inds = np.random.choice(cali_xs.shape[0], 16, replace=False)
@@ -820,7 +922,7 @@ def main():
                     np.random.shuffle(inds)
                     qnn.set_running_stat(True, opt.rs_sm_only)
                     n_batches = int(cali_xs.size(0) / 16)
-                    for i in trange(n_batches, desc="running_stat"):
+                    for i in trange(n_batches, desc="running_stat", disable=(rank != 0 or opt.nvtx_profile)):
                         sl = inds[i*16:(i+1)*16]
                         _xs = cali_xs[sl].to(device)
                         _ts = cali_ts[sl].to(device)
@@ -837,15 +939,15 @@ def main():
                     cali_data=cali_data, batch_size=opt.cali_batch_size,
                     iters=opt.cali_iters_a, act_quant=True,
                     opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p,
-                    cond=opt.cond, sequential=opt.sequential_a, multi_gpu=False)
+                    cond=opt.cond, sequential=opt.sequential_a, multi_gpu=False, weight_quant=enable_weight_quant)
                 recon_model(qnn)
-                qnn.set_quant_state(weight_quant=True, act_quant=True)
+                qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=True)
                 log(f"  Activation calibration done in {elapsed(t_act)}")
                 log_gpu("after act calibration")
 
-            elif opt.quant_act:
+            elif enable_act_quant:
                 log("  Online activation calibration mode (no LSQ)")
-                qnn.set_quant_state(weight_quant=True, act_quant=True)
+                qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=True)
 
             # Final checkpoint save
             log("")
@@ -855,7 +957,7 @@ def main():
                 if isinstance(m, AdaRoundQuantizer):
                     m.zero_point = nn.Parameter(m.zero_point)
                     m.delta = nn.Parameter(m.delta)
-                elif isinstance(m, UniformAffineQuantizer) and opt.quant_act and opt.disable_online_act_quant:
+                elif isinstance(m, UniformAffineQuantizer) and enable_act_quant and opt.disable_online_act_quant:
                     if m.zero_point is not None:
                         if not torch.is_tensor(m.zero_point):
                             m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
@@ -881,6 +983,9 @@ def main():
         model.transformer = qnn
         log(f"  Quantized transformer attached to pipeline in {elapsed(t0)}")
         log_gpu("after full PTQ")
+    if opt.nvtx_profile:
+        suppress_quant_module_prints(model.transformer)
+    step_tracker = install_nvtx_instrumentation(model, opt.nvtx_profile)
 
     # ── 4. Sampling ───────────────────────────────────────────────────────────
     log("")
@@ -915,11 +1020,14 @@ def main():
         n_total = pes.shape[0]
         n_batches = (n_total + batch_size - 1) // batch_size
         log(f"  Generating {n_total} images in {n_batches} batches of {batch_size}...")
-        for i in tqdm(range(0, pes.shape[0], batch_size), desc="sampling"):
+        for i in tqdm(range(0, pes.shape[0], batch_size), desc="sampling", disable=opt.nvtx_profile):
             torch.manual_seed(42)
             prompt_embeds = pes[i:i + batch_size].to(device)
             t_img = time.time()
-            image = model(
+            image = run_generation( 
+                model,
+                step_tracker,
+                opt.nvtx_profile,
                 prompt=None, negative_prompt=None,
                 prompt_embeds=prompt_embeds,
                 prompt_attention_mask=pams[i:i + batch_size].to(device),
@@ -935,7 +1043,15 @@ def main():
     else:
         torch.manual_seed(42)
         log(f"  Prompt: '{opt.prompt}'")
-        image = model(prompt=[opt.prompt], height=opt.res, width=opt.res).images
+        image = run_generation(
+                model,
+                step_tracker,
+                opt.nvtx_profile,
+                prompt=opt.prompt,
+                height=opt.res,
+                width=opt.res,
+            ).images
+
         for j, img in enumerate(image):
             out_path = os.path.join(sample_path, f"{j}.png")
             img.save(out_path)

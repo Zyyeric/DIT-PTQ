@@ -32,6 +32,7 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock,
                          cond: bool = False,
                          is_sm: bool = False,
                          sequential: bool = False,
+                         weight_quant: bool = True,
                          no_adaround: bool = False):
     """
     Block-level reconstruction to optimize rounding or activation scale.
@@ -48,9 +49,9 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock,
 
     model.set_quant_state(False, False)
     if sequential:
-        model.set_quant_state(True, act_quant)
+        model.set_quant_state(weight_quant, act_quant)
         logger.debug(f"[BlockRecon] Sequential mode — full model quant state set")
-    block.set_quant_state(True, act_quant)
+    block.set_quant_state(weight_quant, act_quant)
     round_mode = 'learned_hard_sigmoid'
 
     if not include_act_func:
@@ -156,14 +157,13 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock,
     logger.debug(f"[BlockRecon] Caching inp/out data (batch_size={batch_size})...")
     t_cache = time.time()
     cached_inps, cached_outs = save_inp_oup_data(
-        model, block, cali_data, asym, act_quant,
+        model, block, cali_data, asym, act_quant, weight_quant, 
         batch_size,          # FIX: was hardcoded 8
         keep_gpu=False, cond=cond, is_sm=is_sm)
     logger.debug(f"[BlockRecon] Cache built in {time.time()-t_cache:.1f}s")
 
     if opt_mode != 'mse':
-        cached_grads = save_grad_data(model, block, cali_data, act_quant,
-                                      batch_size=batch_size)
+        cached_grads = save_grad_data(model, block, cali_data, act_quant=act_quant, batch_size=batch_size, weight_quant=weight_quant)
     else:
         cached_grads = None
 
@@ -228,11 +228,12 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock,
     torch.cuda.empty_cache()
 
     # Finalize — hard rounding
-    for name, module in block.named_modules():
-        if isinstance(module, QuantModule):
-            module.weight_quantizer.soft_targets = False
-            if module.split != 0:
-                module.weight_quantizer_0.soft_targets = False
+    if not act_quant:
+        for name, module in block.named_modules():
+            if isinstance(module, QuantModule) and hasattr(module.weight_quantizer, "soft_targets"):
+                module.weight_quantizer.soft_targets = False
+                if module.split != 0:
+                    module.weight_quantizer_0.soft_targets = False
 
     if not include_act_func:
         block.activation_function = org_act_func
