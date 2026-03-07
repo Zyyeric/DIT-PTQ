@@ -20,6 +20,7 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
                          asym: bool = False, include_act_func: bool = True, b_range: tuple = (20, 2),
                          warmup: float = 0.0, act_quant: bool = False, lr: float = 4e-5, p: float = 2.0,
                          multi_gpu: bool = False, cond: bool = False, is_sm: bool = False, sequential: bool = False,
+                         weight_quant: bool = True,
                          no_adaround: bool = False):
     """
     Block reconstruction to optimize the output from each block.
@@ -45,8 +46,8 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
     """
     model.set_quant_state(False, False)
     if sequential:
-        model.set_quant_state(True, act_quant)
-    block.set_quant_state(True, act_quant)
+        model.set_quant_state(weight_quant, act_quant)
+    block.set_quant_state(weight_quant, act_quant)
     round_mode = 'learned_hard_sigmoid'
 
     if not include_act_func:
@@ -133,9 +134,11 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
     # cached_inps, cached_outs = save_inp_oup_data(
         # model, block, cali_data, asym, act_quant, batch_size, keep_gpu=False, cond=cond, is_sm=is_sm)
     cached_inps, cached_outs = save_inp_oup_data(
-        model, block, cali_data, asym, act_quant, 8, keep_gpu=False, cond=cond, is_sm=is_sm)
+        model, block, cali_data, asym, act_quant, weight_quant, 8, keep_gpu=False, cond=cond, is_sm=is_sm)
     if opt_mode != 'mse':
-        cached_grads = save_grad_data(model, block, cali_data, act_quant, batch_size=batch_size)
+        cached_grads = save_grad_data(
+            model, block, cali_data, act_quant=act_quant, batch_size=batch_size, weight_quant=weight_quant
+        )
     else:
         cached_grads = None
     device = 'cuda'
@@ -190,11 +193,12 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
     torch.cuda.empty_cache()
 
     # Finish optimization, use hard rounding.
-    for name, module in block.named_modules():
-        if isinstance(module, QuantModule):
-            module.weight_quantizer.soft_targets = False
-            if module.split != 0:
-                module.weight_quantizer_0.soft_targets = False
+    if not act_quant:
+        for name, module in block.named_modules():
+            if isinstance(module, QuantModule) and hasattr(module.weight_quantizer, "soft_targets"):
+                module.weight_quantizer.soft_targets = False
+                if module.split != 0:
+                    module.weight_quantizer_0.soft_targets = False
 
     # Reset original activation function
     if not include_act_func:

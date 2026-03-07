@@ -20,6 +20,7 @@ def layer_reconstruction(model: QuantModel, layer: QuantModule, cali_data: torch
                          asym: bool = False, include_act_func: bool = True, b_range: tuple = (20, 2),
                          warmup: float = 0.0, act_quant: bool = False, lr: float = 4e-5, p: float = 2.0,
                          multi_gpu: bool = False, cond: bool = False, is_sm: bool = False, sequential: bool = False,
+                         weight_quant: bool = True,
                          no_adaround: bool = False):
     """
     Block reconstruction to optimize the output from each layer.
@@ -46,8 +47,8 @@ def layer_reconstruction(model: QuantModel, layer: QuantModule, cali_data: torch
 
     model.set_quant_state(False, False)
     if sequential:
-        model.set_quant_state(True, act_quant)
-    layer.set_quant_state(True, act_quant)
+        model.set_quant_state(weight_quant, act_quant)
+    layer.set_quant_state(weight_quant, act_quant)
     round_mode = 'learned_hard_sigmoid'
 
     if not include_act_func:
@@ -93,9 +94,11 @@ def layer_reconstruction(model: QuantModel, layer: QuantModule, cali_data: torch
     # cached_inps, cached_outs = save_inp_oup_data(
     #     model, layer, cali_data, asym, act_quant, batch_size, keep_gpu=False, cond=cond, is_sm=is_sm)
     cached_inps, cached_outs = save_inp_oup_data(
-        model, layer, cali_data, asym, act_quant, 8, keep_gpu=False, cond=cond, is_sm=is_sm)
+        model, layer, cali_data, asym, act_quant, weight_quant, 8, keep_gpu=False, cond=cond, is_sm=is_sm)
     if opt_mode != 'mse':
-        cached_grads = save_grad_data(model, layer, cali_data, act_quant, batch_size=batch_size)
+        cached_grads = save_grad_data(
+            model, layer, cali_data, act_quant=act_quant, batch_size=batch_size, weight_quant=weight_quant
+        )
     else:
         cached_grads = None
     device = 'cuda'
@@ -125,9 +128,10 @@ def layer_reconstruction(model: QuantModel, layer: QuantModule, cali_data: torch
     torch.cuda.empty_cache()
 
     # Finish optimization, use hard rounding.
-    layer.weight_quantizer.soft_targets = False
-    if layer.split != 0:
-        layer.weight_quantizer_0.soft_targets = False
+    if not act_quant and hasattr(layer.weight_quantizer, "soft_targets"):
+        layer.weight_quantizer.soft_targets = False
+        if layer.split != 0:
+            layer.weight_quantizer_0.soft_targets = False
 
     # Reset original activation function
     if not include_act_func:

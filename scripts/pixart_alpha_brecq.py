@@ -146,6 +146,12 @@ def is_transformer_block(name, module):
     return all(hasattr(module, attr) for attr in ("attn1", "ff", "norm1"))
 
 
+def suppress_quant_module_prints(module):
+    for submodule in module.modules():
+        if isinstance(submodule, QuantModule):
+            submodule.run_prints = False
+
+
 def install_nvtx_instrumentation(pipeline, enabled: bool):
     step_tracker = DenoisingStepTracker()
     if not enabled:
@@ -352,6 +358,14 @@ def main():
     parser.add_argument(
         "--quant_act", action="store_true", 
         help="if to quantize activations when ptq==True"
+    )
+    parser.add_argument(
+        "--weight_only", action="store_true",
+        help="Quantize weights only and keep activations in FP16/BF16.",
+    )
+    parser.add_argument(
+        "--act_only", action="store_true",
+        help="Quantize activations only and keep weights in FP16/BF16.",
     )
     parser.add_argument(
         "--weight_bit",
@@ -620,6 +634,16 @@ def main():
 
     assert(opt.cond)
     if opt.ptq:
+        if opt.weight_only and opt.act_only:
+            raise ValueError("--weight_only and --act_only are mutually exclusive")
+        if opt.resume_w and opt.act_only:
+            raise ValueError("--resume_w is only valid when weight quantization is enabled")
+
+        enable_weight_quant = not opt.act_only
+        enable_act_quant = opt.quant_act or opt.act_only
+        if opt.weight_only:
+            enable_act_quant = False
+
         wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse', 'fp': True, 
                     'mantissa_bits': opt.weight_mantissa_bits,
                     'attn_weight_mantissa': opt.attn_weight_mantissa,
@@ -629,7 +653,7 @@ def main():
                     'fp': (not opt.disable_fp_quant),
                     'group_quant': (not opt.disable_group_quant)
                     }
-        aq_params = {'n_bits': opt.act_bit, 'channel_wise': False, 'scale_method': 'mse', 'leaf_param':  opt.quant_act, 
+        aq_params = {'n_bits': opt.act_bit, 'channel_wise': False, 'scale_method': 'mse', 'leaf_param':  enable_act_quant, 
                     'mantissa_bits': opt.act_mantissa_bits,
                     'asym_softmax': opt.asym_softmax,
                     'online_act_quant': (not opt.disable_online_act_quant),
@@ -659,7 +683,10 @@ def main():
             #cali_data = (noisy_latents, timesteps, class_labels)
             sample_data = torch.load(opt.cali_data_path)
             cali_data = get_train_samples_custom(opt, sample_data, opt.ddim_steps)
-            resume_cali_model(qnn, opt.cali_ckpt, cali_data, opt.quant_act, "qdiff", cond=opt.cond)
+            resume_cali_model(
+                qnn, opt.cali_ckpt, cali_data, enable_act_quant, "qdiff",
+                cond=opt.cond, weight_quant=enable_weight_quant
+            )
         else:
             logger.info(f"Sampling data from {opt.cali_st} timesteps for calibration")
             
@@ -682,11 +709,17 @@ def main():
 
             cali_xs, cali_ts, cali_cs = cali_data
             if opt.resume_w:
-                resume_cali_model(qnn, opt.cali_ckpt, cali_data, False, cond=opt.cond)
+                resume_cali_model(
+                    qnn, opt.cali_ckpt, cali_data, False,
+                    cond=opt.cond, weight_quant=enable_weight_quant
+                )
             else:
-                logger.info("Initializing weight quantization parameters")
+                if enable_weight_quant:
+                    logger.info("Initializing weight quantization parameters")
+                else:
+                    logger.info("Skipping weight quantization; activations will be calibrated against FP16/BF16 weights")
 
-            qnn.set_quant_state(weight_quant=True, act_quant=False)
+            qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=False)
 
             #print(qnn)
             cali_xs = cali_xs.to(device)
@@ -704,7 +737,7 @@ def main():
             kwargs = dict(cali_data=cali_data, batch_size=opt.cali_batch_size, 
                     iters=opt.cali_iters, weight=0.01, asym=True, b_range=(20, 2),
                     warmup=0.2, act_quant=False, opt_mode='mse', cond=opt.cond, sequential=opt.sequential_w,
-                    no_adaround=opt.no_adaround, multi_gpu=use_ddp)
+                    no_adaround=opt.no_adaround, multi_gpu=use_ddp, weight_quant=enable_weight_quant)
         
             def recon_model(model):
                 """
@@ -738,7 +771,7 @@ def main():
                     else:
                         recon_model(module)
 
-            if not opt.resume_w:
+            if enable_weight_quant and not opt.resume_w:
                 logger.info("Doing weight calibration")
                 recon_model(qnn)
                 qnn.set_quant_state(weight_quant=True, act_quant=False)
@@ -750,7 +783,7 @@ def main():
                     if isinstance(m, AdaRoundQuantizer):
                         m.zero_point = nn.Parameter(m.zero_point)
                         m.delta = nn.Parameter(m.delta)
-                    elif isinstance(m, UniformAffineQuantizer) and opt.quant_act:
+                    elif isinstance(m, UniformAffineQuantizer) and enable_act_quant:
                         if m.zero_point is not None:
                             if not torch.is_tensor(m.zero_point):
                                 m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
@@ -759,12 +792,12 @@ def main():
                 if is_main_process:
                     torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt_wq.pth"))
                 logger.info(model.transformer)
-            if opt.quant_act and opt.disable_online_act_quant:
+            if enable_act_quant and opt.disable_online_act_quant:
                 logger.info("UNet model")
                 logger.info(model.transformer)                    
                 logger.info("Doing activation calibration")
                 # Initialize activation quantization parameters
-                qnn.set_quant_state(True, True)
+                qnn.set_quant_state(enable_weight_quant, True)
                 with torch.no_grad():
                     inds = np.random.choice(cali_xs.shape[0], 16, replace=False)
                     _ = qnn(
@@ -778,7 +811,7 @@ def main():
                         inds = np.arange(cali_xs.shape[0])
                         np.random.shuffle(inds)
                         qnn.set_running_stat(True, opt.rs_sm_only)
-                        for i in trange(int(cali_xs.size(0) / 16)):
+                        for i in trange(int(cali_xs.size(0) / 16), disable=opt.nvtx_profile):
                             _ = qnn(
                                 cali_xs[inds[i * 16:(i + 1) * 16]],
                                 timestep=cali_ts[inds[i * 16:(i + 1) * 16]],
@@ -791,13 +824,13 @@ def main():
                 kwargs = dict(
                     cali_data=cali_data, batch_size=opt.cali_batch_size, iters=opt.cali_iters_a, act_quant=True, 
                     opt_mode='mse', lr=opt.cali_lr, p=opt.cali_p, cond=opt.cond,
-                    sequential=opt.sequential_a, multi_gpu=use_ddp)
+                    sequential=opt.sequential_a, multi_gpu=use_ddp, weight_quant=enable_weight_quant)
                 recon_model(qnn)
-                qnn.set_quant_state(weight_quant=True, act_quant=True)
-            elif opt.quant_act:
+                qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=True)
+            elif enable_act_quant:
                 # To be implement
                 logger.info("Doing online activation calibration")
-                qnn.set_quant_state(weight_quant=True, act_quant=True)
+                qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=True)
             # Currently, this does not work
             """
             print("Report delta change")
@@ -811,7 +844,7 @@ def main():
                 if isinstance(m, AdaRoundQuantizer):
                     m.zero_point = nn.Parameter(m.zero_point)
                     m.delta = nn.Parameter(m.delta)
-                elif isinstance(m, UniformAffineQuantizer) and opt.quant_act and opt.disable_online_act_quant:
+                elif isinstance(m, UniformAffineQuantizer) and enable_act_quant and opt.disable_online_act_quant:
                     if m.zero_point is not None:
                         if not torch.is_tensor(m.zero_point):
                             m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
@@ -821,6 +854,9 @@ def main():
 
         qnn = qnn.to(device=device, dtype=torch.float16)
         model.transformer = qnn
+
+    if opt.nvtx_profile:
+        suppress_quant_module_prints(model.transformer)
 
     step_tracker = install_nvtx_instrumentation(model, opt.nvtx_profile)
     
@@ -847,7 +883,7 @@ def main():
         for start in tqdm(
             range(0, len(local_indices), batch_size),
             desc=f"rank{rank}-data",
-            disable=(rank != 0),
+            disable=(rank != 0 or opt.nvtx_profile),
         ):
             torch.manual_seed(42)
             batch_idx = local_indices[start:start + batch_size]
@@ -891,7 +927,7 @@ def main():
         #    start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
         batch_size = opt.n_samples
         if opt.prompt is None:
-            for i in tqdm(range(0, pes.shape[0], batch_size), desc="data"):
+            for i in tqdm(range(0, pes.shape[0], batch_size), desc="data", disable=opt.nvtx_profile):
                 torch.manual_seed(42) # Meaning of Life, the Universe and Everything
                 prompt_embeds = pes[i:i + batch_size].to(device)
                 image = run_generation(

@@ -46,7 +46,8 @@ def sync_grads(opt_params):
 
 
 def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBlock], cali_data: torch.Tensor,
-                      asym: bool = False, act_quant: bool = False, batch_size: int = 32, keep_gpu: bool = True,
+                      asym: bool = False, act_quant: bool = False, weight_quant: bool = True,
+                      batch_size: int = 32, keep_gpu: bool = True,
                       cond: bool = False, is_sm: bool = False):
     """
     Save input data and output data of a particular layer/block over calibration dataset.
@@ -63,7 +64,9 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
     :return: input and output data
     """
     device = next(model.parameters()).device
-    get_inp_out = GetLayerInpOut(model, layer, device=device, asym=asym, act_quant=act_quant)
+    get_inp_out = GetLayerInpOut(
+        model, layer, device=device, asym=asym, act_quant=act_quant, weight_quant=weight_quant
+    )
     cached_batches = []
     cached_inps, cached_outs = None, None
     torch.cuda.empty_cache()
@@ -209,7 +212,7 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
 
 def save_grad_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBlock], cali_data: torch.Tensor,
                    damping: float = 1., act_quant: bool = False, batch_size: int = 32,
-                   keep_gpu: bool = True):
+                   keep_gpu: bool = True, weight_quant: bool = True):
     """
     Save gradient data of a particular layer/block over calibration dataset.
 
@@ -223,7 +226,7 @@ def save_grad_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBlock],
     :return: gradient data
     """
     device = next(model.parameters()).device
-    get_grad = GetLayerGrad(model, layer, device, act_quant=act_quant)
+    get_grad = GetLayerGrad(model, layer, device, act_quant=act_quant, weight_quant=weight_quant)
     cached_batches = []
     torch.cuda.empty_cache()
 
@@ -280,12 +283,14 @@ class DataSaverHook:
 
 class GetLayerInpOut:
     def __init__(self, model: QuantModel, layer: Union[QuantModule, BaseQuantBlock],
-                 device: torch.device, asym: bool = False, act_quant: bool = False):
+                 device: torch.device, asym: bool = False, act_quant: bool = False,
+                 weight_quant: bool = True):
         self.model = model
         self.layer = layer
         self.asym = asym
         self.device = device
         self.act_quant = act_quant
+        self.weight_quant = weight_quant
         self.data_saver = DataSaverHook(store_input=True, store_output=True, stop_forward=True)
 
     def __call__(self, x, timesteps, context=None):
@@ -306,7 +311,7 @@ class GetLayerInpOut:
             if self.asym:
                 # Recalculate input with network quantized
                 self.data_saver.store_output = False
-                self.model.set_quant_state(weight_quant=True, act_quant=self.act_quant)
+                self.model.set_quant_state(weight_quant=self.weight_quant, act_quant=self.act_quant)
                 try:
                     # NOTE BRECQ issues.
                     #_ = self.model(x, timesteps, context)
@@ -319,7 +324,7 @@ class GetLayerInpOut:
         handle.remove()
 
         self.model.set_quant_state(False, False)
-        self.layer.set_quant_state(True, self.act_quant)
+        self.layer.set_quant_state(self.weight_quant, self.act_quant)
         self.model.train()
 
         # NOTE For Diffusers compat.
@@ -357,11 +362,12 @@ class GradSaverHook:
 
 class GetLayerGrad:
     def __init__(self, model: QuantModel, layer: Union[QuantModule, BaseQuantBlock],
-                 device: torch.device, act_quant: bool = False):
+                 device: torch.device, act_quant: bool = False, weight_quant: bool = True):
         self.model = model
         self.layer = layer
         self.device = device
         self.act_quant = act_quant
+        self.weight_quant = weight_quant
         self.data_saver = GradSaverHook(True)
 
     def __call__(self, model_input):
@@ -381,7 +387,7 @@ class GetLayerGrad:
                 inputs = model_input.to(self.device)
                 self.model.set_quant_state(False, False)
                 out_fp = self.model(inputs)
-                quantize_model_till(self.model, self.layer, self.act_quant)
+                quantize_model_till(self.model, self.layer, self.act_quant, self.weight_quant)
                 out_q = self.model(inputs)
                 loss = F.kl_div(F.log_softmax(out_q, dim=1), F.softmax(out_fp, dim=1), reduction='batchmean')
                 loss.backward()
@@ -390,12 +396,13 @@ class GetLayerGrad:
 
         handle.remove()
         self.model.set_quant_state(False, False)
-        self.layer.set_quant_state(True, self.act_quant)
+        self.layer.set_quant_state(self.weight_quant, self.act_quant)
         self.model.train()
         return self.data_saver.grad_out.data
 
 
-def quantize_model_till(model: QuantModule, layer: Union[QuantModule, BaseQuantBlock], act_quant: bool = False):
+def quantize_model_till(model: QuantModule, layer: Union[QuantModule, BaseQuantBlock], act_quant: bool = False,
+                        weight_quant: bool = True):
     """
     We assumes modules are correctly ordered, holds for all models considered
     :param model: quantized_model
@@ -404,7 +411,7 @@ def quantize_model_till(model: QuantModule, layer: Union[QuantModule, BaseQuantB
     model.set_quant_state(False, False)
     for name, module in model.named_modules():
         if isinstance(module, (QuantModule, BaseQuantBlock)):
-            module.set_quant_state(True, act_quant)
+            module.set_quant_state(weight_quant, act_quant)
         if module == layer:
             break
 
@@ -526,67 +533,72 @@ def convert_adaround(model):
 # qnn is model
 # ckpt_path is where to store quantized weights
 # cali_data is calibration data. But loaded. E.g., for resume its randomly generated
-def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode='qdiff', cond=False):
+def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode='qdiff',
+                      cond=False, weight_quant=True):
     print("Loading quantized model checkpoint")
     ckpt = torch.load(ckpt_path, map_location='cpu')
-    
-    print("Initializing weight quantization parameters")
-    qnn.set_quant_state(True, False)
+    cali_xs, cali_ts, cali_cs = None, None, None
+
     if not cond:
         cali_xs, cali_ts = cali_data
-        _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda())
-    # NOTE Exception for SDXL
     elif len(cali_data) == 5:
         cali_xs, cali_ts, cali_cs, cali_tes, cali_tid = cali_data
-        _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda(), encoder_hidden_states=cali_cs[:1].cuda(), added_cond_kwargs={"text_embeds": cali_tes[:1].cuda(), "time_ids": cali_tid.cuda()}, cross_attention_kwargs={}, return_dict=False)
-    elif len(cali_data) == 4:
-        # TODO fix when required.
-        cali_xs, cali_ts, cali_cs = cali_data
-        with torch.no_grad():
-            _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
     else:
-        # NOTE this is what is used by PixArt
         cali_xs, cali_ts, cali_cs = cali_data
-        cali_xs = cali_xs.to(torch.float16)
-        cali_cs = cali_cs.to(torch.float16)
-        with torch.no_grad():
-            _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
-    # change weight quantizer from uniform to adaround
-    # e.g., prior to calling convert adaround, must pass data through. 
-    # this generates deltas in weights - the distribution of cali data does not matter. 
-    # NOTE: I think this is actually just so they exist so other ones can be loaded.
-    # NOTE: --resume only works for AdaRound weights quantization
-    convert_adaround(qnn)
-    
-    # Make the zero_point and delta parameters
-    for m in qnn.model.modules():
-        if isinstance(m, AdaRoundQuantizer):
-            m.zero_point = nn.Parameter(m.zero_point)
-            m.delta = nn.Parameter(m.delta)
 
-    # remove act_quantizer states for now
-    keys = [key for key in ckpt.keys() if "act" in key]
-    for key in keys:
-        del ckpt[key]
-    qnn.load_state_dict(ckpt, strict=(act_quant_mode=='qdiff'))
-    qnn.set_quant_state(weight_quant=True, act_quant=False)
-    
-    # Now this seems to be reversing what we did about parameters. 
-    # It seems they are only set as parameters for storage in state_dict
-    for m in qnn.model.modules():
-        if isinstance(m, AdaRoundQuantizer):
-            zero_data = m.zero_point.data
-            delattr(m, "zero_point")
-            m.zero_point = zero_data
+    if weight_quant:
+        print("Initializing weight quantization parameters")
+        qnn.set_quant_state(True, False)
+        if not cond:
+            _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda())
+        # NOTE Exception for SDXL
+        elif len(cali_data) == 5:
+            _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda(), encoder_hidden_states=cali_cs[:1].cuda(), added_cond_kwargs={"text_embeds": cali_tes[:1].cuda(), "time_ids": cali_tid.cuda()}, cross_attention_kwargs={}, return_dict=False)
+        elif len(cali_data) == 4:
+            # TODO fix when required.
+            with torch.no_grad():
+                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
+        else:
+            # NOTE this is what is used by PixArt
+            cali_xs = cali_xs.to(torch.float16)
+            cali_cs = cali_cs.to(torch.float16)
+            with torch.no_grad():
+                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
+        # change weight quantizer from uniform to adaround
+        # e.g., prior to calling convert adaround, must pass data through.
+        # this generates deltas in weights - the distribution of cali data does not matter.
+        # NOTE: --resume only works for AdaRound weights quantization
+        convert_adaround(qnn)
 
-            delta_data = m.delta.data
-            delattr(m, "delta")
-            m.delta = delta_data
+        # Make the zero_point and delta parameters
+        for m in qnn.model.modules():
+            if isinstance(m, AdaRoundQuantizer):
+                m.zero_point = nn.Parameter(m.zero_point)
+                m.delta = nn.Parameter(m.delta)
+
+        # remove act_quantizer states for now
+        keys = [key for key in ckpt.keys() if "act" in key]
+        for key in keys:
+            del ckpt[key]
+        qnn.load_state_dict(ckpt, strict=(act_quant_mode=='qdiff'))
+        qnn.set_quant_state(weight_quant=True, act_quant=False)
+
+        # Now this seems to be reversing what we did about parameters.
+        # It seems they are only set as parameters for storage in state_dict
+        for m in qnn.model.modules():
+            if isinstance(m, AdaRoundQuantizer):
+                zero_data = m.zero_point.data
+                delattr(m, "zero_point")
+                m.zero_point = zero_data
+
+                delta_data = m.delta.data
+                delattr(m, "delta")
+                m.delta = delta_data
 
     # This conditional makes the code look so very hacky...
     if quant_act:       
         print("Initializing act quantization parameters")
-        qnn.set_quant_state(True, True)
+        qnn.set_quant_state(weight_quant, True)
         if not cond:
             _ = qnn(cali_xs[:1].cuda(), cali_ts[:1].cuda())
         # NOTE Exception for SDXL, doesn't work
@@ -601,7 +613,6 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
                 _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
         else:
             # NOTE PixArt
-            cali_xs, cali_ts, cali_cs = cali_data
             cali_xs = cali_xs.to(torch.float16)
             cali_cs = cali_cs.to(torch.float16)
             with torch.no_grad():
@@ -620,8 +631,8 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
                         m.zero_point = nn.Parameter(m.zero_point)
                     
         ckpt = torch.load(ckpt_path, map_location='cpu')
-        qnn.load_state_dict(ckpt)
-        qnn.set_quant_state(weight_quant=True, act_quant=True)
+        qnn.load_state_dict(ckpt, strict=weight_quant)
+        qnn.set_quant_state(weight_quant=weight_quant, act_quant=True)
         
         for m in qnn.model.modules():
             if isinstance(m, AdaRoundQuantizer):
