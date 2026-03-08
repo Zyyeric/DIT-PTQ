@@ -36,7 +36,6 @@ echo "Config:"
 echo "  OUTDIR        = ${OUTDIR}"
 echo "  CALI_DATA     = ${CALI_DATA}"
 echo "=========================================="
-set -e
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=8
 export HF_HUB_DISABLE_SYMLINKS_WARNING=1

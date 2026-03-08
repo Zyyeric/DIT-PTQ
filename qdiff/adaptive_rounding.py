@@ -69,16 +69,17 @@ class AdaRoundQuantizer(nn.Module):
 
     def forward(self, x):
         x_shape_old = x.shape
+        is_group = getattr(self, 'group_quant', False) and x.ndim == 2
 
         # Handle group quantization reshaping
-        if getattr(self, 'group_quant', False):
+        if is_group:
             x = x.view(-1, self.group_size)
 
         if self.fp:
             x_dequant = quantize_to_fp8_ste_MM_soft_targets(
                 x, self.n_bits, self.delta, self.mantissa_bits,
                 self.sign_bits, self.get_soft_targets())
-            if getattr(self, 'group_quant', False):
+            if is_group:
                 x_dequant = x_dequant.view(x_shape_old)
             return x_dequant
 
@@ -92,7 +93,7 @@ class AdaRoundQuantizer(nn.Module):
         x_quant   = torch.clamp(x_int + self.zero_point, self.q_min, self.q_max)
         x_float_q = (x_quant - self.zero_point) * self.delta
 
-        if getattr(self, 'group_quant', False):
+        if is_group:
             x_float_q = x_float_q.view(x_shape_old)
         return x_float_q
 
@@ -102,7 +103,8 @@ class AdaRoundQuantizer(nn.Module):
             0, 1)
 
     def init_alpha(self, x: torch.Tensor):
-        if getattr(self, 'group_quant', False):
+        is_group = getattr(self, 'group_quant', False) and x.ndim == 2
+        if is_group:
             x = x.view(-1, self.group_size)
 
         if self.fp:
@@ -110,7 +112,6 @@ class AdaRoundQuantizer(nn.Module):
                 x, self.n_bits, self.maxval, self.mantissa_bits, self.sign_bits)
 
             # BUG FIX: clamp rest to avoid log(0) or log(negative) → NaN
-            # rest == gamma when weight is exactly on an FP grid point
             eps  = 1e-6
             rest = rest.clamp(self.gamma + eps, self.zeta - eps)
             alpha = -torch.log((self.zeta - self.gamma) / (rest - self.gamma) - 1)

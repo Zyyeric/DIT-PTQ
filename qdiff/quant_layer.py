@@ -105,11 +105,13 @@ class UniformAffineQuantizer(nn.Module):
                      f"q_min={self.q_min} q_max={self.q_max}")
 
     def forward(self, x: torch.Tensor):
-        # [SAFEGUARD]: Catch dimension incompatibilities early
-        assert x.shape[-1] % self.group_size == 0, \
-                f"Dimension {x.shape[-1]} is not divisible by group_size {self.group_size}"
+        # [SAFEGUARD]: Group quantization is for 2D Linear layers. 
+        # Applying it to 4D Conv2d weights breaks per-channel broadcasting.
+        is_group = self.group_quant and x.ndim == 2
 
-        if self.group_quant:
+        if is_group:
+            assert x.shape[-1] % self.group_size == 0, \
+                    f"Dimension {x.shape[-1]} is not divisible by group_size {self.group_size}"
             x_old = x
             x = x.view(-1, self.group_size)
 
@@ -151,7 +153,7 @@ class UniformAffineQuantizer(nn.Module):
             else:
                 x_dequant = quantize_to_fp8_ste_MM(
                     x, self.n_bits, self.delta, self.mantissa_bits, self.sign_bits)
-            if self.group_quant:
+            if is_group:
                 x_dequant = x_dequant.view(x_old.shape)
             return x_dequant
 
@@ -170,7 +172,7 @@ class UniformAffineQuantizer(nn.Module):
         x_quant  = torch.clamp(x_int, self.q_min, self.q_max)
         x_dequant = (x_quant - self.zero_point) * self.delta
 
-        if self.group_quant:
+        if is_group:
             x_dequant = x_dequant.view(x_old.shape)
         return x_dequant
 

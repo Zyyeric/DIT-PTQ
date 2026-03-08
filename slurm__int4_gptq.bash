@@ -36,7 +36,6 @@ echo "Config:"
 echo "  OUTDIR        = ${OUTDIR}"
 echo "  CALI_DATA     = ${CALI_DATA}"
 echo "=========================================="
-set -e
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=8
 export HF_HUB_DISABLE_SYMLINKS_WARNING=1
@@ -68,26 +67,26 @@ echo ""
 # ── Run ───────────────────────────────────────────────────────────────────────
 echo "Starting INT4 GPTQ Calibration and Generation..."
 
-python scripts/pixart_alpha_brecq.py \\
-  --cond \\
-  --n_samples 1 \\
-  --res 512 \\
-  --coco_10k \\
-  --outdir "\${OUTDIR}" \\
-  --cali_data_path "\${CALI_DATA}" \\
-  --ptq \\
-  --quant_mode qdiff \\
-  --cali_batch_size 16 \\
-  --weight_bit 4 \\
-  --act_bit 8 \\
-  --weight_group_size 128 \\
-  --disable_fp_quant \\
-  --gptq \\
-  --gptq_groupsize 128 \\
-  --gptq_blocksize 128 \\
-  --w_sym \\
-  --w_clip_ratio 1.0 \\
-  --gptq_cali_n 256 \\
+python scripts/pixart_alpha_brecq.py 
+  --cond 
+  --n_samples 1 
+  --res 512 
+  --coco_10k 
+  --outdir "\${OUTDIR}" 
+  --cali_data_path "\${CALI_DATA}" 
+  --ptq 
+  --quant_mode qdiff 
+  --cali_batch_size 16 
+  --weight_bit 4 
+  --act_bit 8 
+  --weight_group_size 128 
+  --disable_fp_quant 
+  --gptq 
+  --gptq_groupsize 128 
+  --gptq_blocksize 128 
+  --w_sym 
+  --w_clip_ratio 1.0 
+  --gptq_cali_n 256 
   --quant_act
 EXIT_CODE=\$?
 
