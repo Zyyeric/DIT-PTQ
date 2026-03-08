@@ -238,26 +238,43 @@ class UniformAffineQuantizer(nn.Module):
         if channel_wise:
             x_clone   = x.clone().detach()
             n_channels = x_clone.shape[0]
-            if   len(x.shape) == 4: x_max = x_clone.abs().max(dim=-1)[0].max(dim=-1)[0].max(dim=-1)[0]
-            elif len(x.shape) == 3: x_max = x_clone.abs().max(dim=-1)[0].max(dim=-1)[0]
-            else:                   x_max = x_clone.abs().max(dim=-1)[0]
-            delta      = x_max.clone()
-            zero_point = x_max.clone()
+            
+            # Setup empty tensors for per-channel scales
+            delta = torch.zeros(n_channels, device=x.device)
+            zero_point = torch.zeros(n_channels, device=x.device)
+            
             for c in range(n_channels):
                 delta[c], zero_point[c] = self.init_quantization_scale_fp(
-                    x_clone[c], channel_wise=False)
+                    x_clone[c], channel_wise=False)   
             if   len(x.shape) == 4: delta = delta.view(-1, 1, 1, 1); zero_point = zero_point.view(-1, 1, 1, 1)
             elif len(x.shape) == 3: delta = delta.view(-1, 1, 1);    zero_point = zero_point.view(-1, 1, 1)
-            else:                   delta = delta.view(-1, 1);        zero_point = zero_point.view(-1, 1)
+            else:                   delta = delta.view(-1, 1);       zero_point = zero_point.view(-1, 1)
         else:
             if self.leaf_param:
                 self.x_min = x.data.min()
                 self.x_max = x.data.max()
-            x_min  = min(x.min().item(), 0)
-            x_max  = max(x.max().item(), 0)
-            x_max  = max(abs(x_max), abs(x_min))
-            delta  = x_max
-            zero_point = torch.zeros(1)
+                
+            x_absmax = x.abs().max().clamp(min=1e-5)
+            
+            # [FIXED]: Actual MSE Grid Search for Floating-Point formats
+            if self.scale_method == 'mse':
+                best_score = 1e10
+                best_absmax = x_absmax.clone()
+                for i in range(100):
+                    new_max = x_absmax * (1.0 - i * 0.001)
+                    x_q = quantize_to_fp8_ste_MM(
+                        x, self.n_bits, new_max, self.mantissa_bits, self.sign_bits)
+                    score = lp_loss(x, x_q, p=2.4, reduction='all')
+                    
+                    if score < best_score:
+                        best_score = score
+                        best_absmax = new_max
+                delta = best_absmax
+            else:
+                delta = x_absmax
+                
+            zero_point = torch.zeros(1).to(delta.device)
+            
         return delta, zero_point
 
     def init_quantization_scale(self, x: torch.Tensor,

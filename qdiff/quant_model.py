@@ -62,12 +62,14 @@ class QuantModel(nn.Module):
             n = 0
             for m in self.model.modules():
                 if isinstance(m, QuantDiffBTB):
-                    # Force asymmetric INT8 mapping to utilize the full 0-255 range
-                    m.attn1.act_quantizer_w.sym = False
-                    m.attn1.act_quantizer_w.always_zero = True 
-                    if m.attn2 is not None:
-                        m.attn2.act_quantizer_w.sym = False
-                        m.attn2.act_quantizer_w.always_zero = True
+                    # Loop safely over both attention blocks
+                    for attn in [m.attn1, m.attn2]:
+                        if attn is not None:
+                            # [FIXED]: Update clamp bounds alongside symmetry!
+                            attn.act_quantizer_w.sym = False
+                            attn.act_quantizer_w.always_zero = True
+                            attn.act_quantizer_w.q_max = (2 ** attn.act_quantizer_w.n_bits) - 1
+                            attn.act_quantizer_w.q_min = 0
                     n += 1
             return  # <--- Exits here during Q-DiT runs!
 

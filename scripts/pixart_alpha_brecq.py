@@ -323,6 +323,9 @@ def main():
         log("STEP 3  Setting up quantization...")
         t0 = time.time()
 
+        is_fp_run = not opt.disable_fp_quant
+        is_symmetric = opt.w_sym or is_fp_run
+
         wq_params = {
             'n_bits': opt.weight_bit, 'channel_wise': True,
             'scale_method': opt.weight_quant_method,
@@ -331,9 +334,9 @@ def main():
             'ff_weight_mantissa': opt.ff_weight_mantissa,
             'weight_group_size': opt.weight_group_size,
             'fp_biased_adaround': opt.no_fp_biased_adaround,
-            'fp': (not opt.disable_fp_quant),
+            'fp': is_fp_run,
             'group_quant': (not opt.disable_group_quant),
-            'sym': opt.w_sym,
+            'sym': is_symmetric,  # Passes True for FP4, regardless of --w_sym
             'clip_ratio': opt.w_clip_ratio
         }
         aq_params = {
@@ -343,7 +346,7 @@ def main():
             'mantissa_bits': opt.act_mantissa_bits,
             'asym_softmax': opt.asym_softmax,
             'online_act_quant': (not opt.disable_online_act_quant),
-            'fp': (not opt.disable_fp_quant)
+            'fp': is_fp_run
         }
         log(f"  wq_params: {wq_params}")
         log(f"  aq_params: {aq_params}")

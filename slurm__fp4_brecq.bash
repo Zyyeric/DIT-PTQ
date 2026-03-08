@@ -81,7 +81,6 @@ python scripts/pixart_alpha_brecq.py \
   --weight_bit 4 \
   --act_bit 8 \
   --weight_group_size 128 \
-  --quant_weight \
   --weight_quant_method mse \
   --cali_iters 20000 \
   --weight_mantissa_bits 1 \
