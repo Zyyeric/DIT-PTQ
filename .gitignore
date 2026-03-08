@@ -15,6 +15,9 @@ env/
 .idea/
 .vscode/
 
+# model
+checkpoints/ 
+
 # Data and model artifacts
 datasets/
 data/
