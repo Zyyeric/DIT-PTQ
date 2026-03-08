@@ -67,9 +67,51 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
     get_inp_out = GetLayerInpOut(
         model, layer, device=device, asym=asym, act_quant=act_quant, weight_quant=weight_quant
     )
-    cached_batches = []
     cached_inps, cached_outs = None, None
     torch.cuda.empty_cache()
+
+    def alloc_like_cpu(value, total):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            return torch.empty((total, *value.shape[1:]), dtype=value.dtype, device='cpu')
+        if isinstance(value, tuple):
+            return tuple(alloc_like_cpu(v, total) for v in value)
+        if isinstance(value, list):
+            return [None] * total
+        return [None] * total
+
+    def store_like_cpu(storage, value, start, end):
+        if storage is None or value is None:
+            return
+        if torch.is_tensor(storage):
+            storage[start:end].copy_(value.detach().cpu())
+            return
+        if isinstance(storage, tuple):
+            for s, v in zip(storage, value):
+                store_like_cpu(s, v, start, end)
+            return
+        if isinstance(storage, list):
+            if torch.is_tensor(value):
+                cpu_value = value.detach().cpu()
+                for offset, item in enumerate(cpu_value):
+                    storage[start + offset] = item
+            elif isinstance(value, list):
+                storage[start:end] = value
+            else:
+                for idx in range(start, end):
+                    storage[idx] = value
+
+    def move_storage_to_device(storage, dst_device):
+        if storage is None:
+            return None
+        if torch.is_tensor(storage):
+            return storage.to(dst_device)
+        if isinstance(storage, tuple):
+            return tuple(move_storage_to_device(v, dst_device) for v in storage)
+        if isinstance(storage, list):
+            return [move_storage_to_device(v, dst_device) for v in storage]
+        return storage
 
     if not cond:
         cali_xs, cali_ts = cali_data
@@ -113,8 +155,9 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
     num = int(cali_xs.size(0) / batch_size)
     if is_sm:
         num //= 2
-    l_in_0, l_in_1, l_in, l_out = 0, 0, 0, 0
     for i in trange(num):
+        start = i * batch_size
+        end = start + batch_size
         if not cond:
             cur_inp, cur_out = get_inp_out(
                 cali_xs[i * batch_size:(i + 1) * batch_size].to(device), 
@@ -133,66 +176,13 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
                 cali_ts[inds[i * batch_size:(i + 1) * batch_size]].to(device),
                 cali_conds[inds[i * batch_size:(i + 1) * batch_size]].to(device)
             )
-        if isinstance(cur_inp, tuple):
-            # Diffusers Transformer Blk
-            # add self.data_saver.input_store[7] len should be 7 -> 8
-            if len(cur_inp) == 8:
-                cached_batches.append(((cur_inp[0],
-                                        cur_inp[1],
-                                        cur_inp[2],
-                                        cur_inp[3],
-                                        cur_inp[4],
-                                        cur_inp[5],
-                                        cur_inp[6],
-                                        cur_inp[7]), cur_out.cpu()))
-            else:
-                cur_x, cur_t = cur_inp
-                if not is_sm:
-                    cached_batches.append(((cur_x.cpu(), cur_t.cpu()), cur_out.cpu()))
-                else:
-                    if cached_inps is None:
-                        l_in_0 = cur_x.shape[0] * num
-                        l_in_1 = cur_t.shape[0] * num
-                        cached_inps = [torch.zeros(l_in_0, *cur_x.shape[1:]), torch.zeros(l_in_1, *cur_t.shape[1:])]
-                    cached_inps[0].index_copy_(0, torch.arange(i * cur_x.shape[0], (i + 1) * cur_x.shape[0]), cur_x.cpu())
-                    cached_inps[1].index_copy_(0, torch.arange(i * cur_t.shape[0], (i + 1) * cur_t.shape[0]), cur_t.cpu())
-        else:
-            if not is_sm:
-                cached_batches.append((cur_inp.cpu(), cur_out.cpu()))
-            else:
-                if cached_inps is None:
-                    l_in = cur_inp.shape[0] * num
-                    cached_inps = torch.zeros(l_in, *cur_inp.shape[1:])
-                cached_inps.index_copy_(0, torch.arange(i * cur_inp.shape[0], (i + 1) * cur_inp.shape[0]), cur_inp.cpu())
-        
-        if is_sm:
-            if cached_outs is None:
-                l_out = cur_out.shape[0] * num
-                cached_outs = torch.zeros(l_out, *cur_out.shape[1:])
-            cached_outs.index_copy_(0, torch.arange(i * cur_out.shape[0], (i + 1) * cur_out.shape[0]), cur_out.cpu())
+        if cached_inps is None:
+            cached_inps = alloc_like_cpu(cur_inp, batch_size * num)
+        if cached_outs is None:
+            cached_outs = alloc_like_cpu(cur_out, batch_size * num)
 
-    if not is_sm:
-        # NOTE for error on this conditional, check if the above for-loop is actually executing it should go through a tqdm.
-        # add self.data_saver.input_store[7] len should be 7 -> 8
-        if isinstance(cached_batches[0][0], tuple) and len(cached_batches[0][0]) == 8:
-            cached_inps = [
-                torch.cat([x[0][0] for x in cached_batches]),
-                torch.cat([x[0][1] for x in cached_batches]) if cached_batches[0][0][1] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][2] for x in cached_batches]) if cached_batches[0][0][2] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][3] for x in cached_batches]) if cached_batches[0][0][3] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][4] for x in cached_batches]) if cached_batches[0][0][4] is not None else [None] * len(cached_batches),
-                [x[0][5] for x in cached_batches],
-                torch.cat([x[0][6] for x in cached_batches]) if cached_batches[0][0][6] is not None else [None] * len(cached_batches),
-                torch.cat([x[0][7] for x in cached_batches]) if cached_batches[0][0][7] is not None else [None] * len(cached_batches),
-            ]
-        elif isinstance(cached_batches[0][0], tuple):
-            cached_inps = [
-                torch.cat([x[0][0] for x in cached_batches]), 
-                torch.cat([x[0][1] for x in cached_batches])
-            ]
-        else:
-            cached_inps = torch.cat([x[0] for x in cached_batches])
-        cached_outs = torch.cat([x[1] for x in cached_batches])
+        store_like_cpu(cached_inps, cur_inp, start, end)
+        store_like_cpu(cached_outs, cur_out, start, end)
     
     #if isinstance(cached_inps, list):
     #    logger.info(f"in 1 shape: {cached_inps[0].shape}, in 2 shape: {cached_inps[1].shape}")
@@ -201,12 +191,10 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
     #logger.info(f"out shape: {cached_outs.shape}")
     torch.cuda.empty_cache()
     if keep_gpu:
-        if isinstance(cached_inps, list):
-            cached_inps[0] = cached_inps[0].to(device)
-            cached_inps[1] = cached_inps[1].to(device)
-        else:
-            cached_inps = cached_inps.to(device)
-        cached_outs = cached_outs.to(device)
+        cached_inps = move_storage_to_device(cached_inps, device)
+        cached_outs = move_storage_to_device(cached_outs, device)
+    if isinstance(cached_inps, tuple):
+        cached_inps = list(cached_inps)
     return cached_inps, cached_outs
 
 
