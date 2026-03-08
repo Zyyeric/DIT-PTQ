@@ -76,7 +76,7 @@ echo ""
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 echo "Starting calibration..."
-python scripts/calib.py
+python scripts/pixart_alpha_calib.py
 
 EXIT_CODE=\$?
 

@@ -105,6 +105,10 @@ class UniformAffineQuantizer(nn.Module):
                      f"q_min={self.q_min} q_max={self.q_max}")
 
     def forward(self, x: torch.Tensor):
+        # [SAFEGUARD]: Catch dimension incompatibilities early
+        assert x.shape[-1] % self.group_size == 0, \
+                f"Dimension {x.shape[-1]} is not divisible by group_size {self.group_size}"
+
         if self.group_quant:
             x_old = x
             x = x.view(-1, self.group_size)
@@ -202,11 +206,31 @@ class UniformAffineQuantizer(nn.Module):
         elif len(x.shape) == 4:
             x = x.reshape(x.shape[0] * x.shape[1], x.shape[2] * x.shape[3])
 
-        x_min    = x.min(dim=-1)[0]
-        x_max    = x.max(dim=-1)[0]
-        x_absmax = torch.maximum(x_min.abs(), x_max.abs())
-        x_dequant = quantize_to_fp8_ste_MM(
-            x, self.n_bits, x_absmax, self.mantissa_bits, self.sign_bits)
+        if self.fp:
+            # FP4DiT Dynamic Floating Point
+            x_min    = x.min(dim=-1, keepdim=True)[0]
+            x_max    = x.max(dim=-1, keepdim=True)[0]
+            x_absmax = torch.maximum(x_min.abs(), x_max.abs())
+            x_dequant = quantize_to_fp8_ste_MM(
+                x, self.n_bits, x_absmax, self.mantissa_bits, self.sign_bits)
+        else:
+            # Q-DiT Dynamic Uniform Integer
+            x_min = x.min(dim=-1, keepdim=True)[0]
+            x_max = x.max(dim=-1, keepdim=True)[0]
+            
+            if self.sym:
+                x_absmax = torch.maximum(x_min.abs(), x_max.abs())
+                delta = x_absmax / self.q_max
+                zero_point = 0
+            else:
+                delta = (x_max - x_min) / self.q_max
+                zero_point = torch.round(-x_min / delta)
+                
+            delta = torch.clamp(delta, min=1e-8)
+            x_int = round_ste(x / delta) + zero_point
+            x_quant = torch.clamp(x_int, self.q_min, self.q_max)
+            x_dequant = (x_quant - zero_point) * delta
+
         return x_dequant.reshape(x_shape)
 
     def init_quantization_scale_fp(self, x: torch.Tensor, channel_wise: bool = False):

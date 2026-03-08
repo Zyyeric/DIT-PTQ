@@ -55,6 +55,22 @@ class QuantModel(nn.Module):
                     f"sm_abit={self.sm_abit}")
 
     def set_asym_for_sm(self, act_quant_params: dict = {}):
+        # ── 1. Q-DiT (INT) Logic ──────────────────────────────────────────
+        if not act_quant_params.get('fp', False):
+            # Recover 50% wasted resolution for Q-DiT Softmax
+            logger.info("QuantModel: INT4 mode. Forcing asymmetric bounds for Softmax.")
+            n = 0
+            for m in self.model.modules():
+                if isinstance(m, QuantDiffBTB):
+                    # Force asymmetric INT8 mapping to utilize the full 0-255 range
+                    m.attn1.act_quantizer_w.sym = False
+                    m.attn1.act_quantizer_w.always_zero = True 
+                    if m.attn2 is not None:
+                        m.attn2.act_quantizer_w.sym = False
+                        m.attn2.act_quantizer_w.always_zero = True
+                    n += 1
+            return  # <--- Exits here during Q-DiT runs!
+
         if act_quant_params.get('asym_softmax', False):
             logger.info("QuantModel: using Symmetric quantization for Softmax")
             return
