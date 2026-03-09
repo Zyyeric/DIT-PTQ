@@ -44,7 +44,8 @@ def resolve_coco_unique_captions(coco_1k=False, coco_9k=False, coco_10k=False):
     return selected
 
 
-def get_captions(name, model, coco_1k=False, coco_9k=False, coco_10k=False, pixart=False, coco2014=False, hpsv2=False):
+def get_captions(name, model, coco_1k=False, coco_9k=False, coco_10k=False, pixart=False, coco2014=False, hpsv2=False,
+                 force_recompute=False):
     if pixart:
         assert not coco_1k
         assert not coco_9k
@@ -93,7 +94,7 @@ def get_captions(name, model, coco_1k=False, coco_9k=False, coco_10k=False, pixa
     # Check if precomputed prompt embedding file already exists
     embedding_fname = os.sep.join(["captions", tag+".pt"])
     print("Checking for file ", embedding_fname)
-    if os.path.isfile(embedding_fname):
+    if os.path.isfile(embedding_fname) and not force_recompute:
         print("File found! Loading precomputed prompt embeddings")
         embedding_dict = torch.load(embedding_fname, map_location="cpu")
         prompt_embeds = embedding_dict['prompt_embeds']
@@ -111,7 +112,10 @@ def get_captions(name, model, coco_1k=False, coco_9k=False, coco_10k=False, pixa
         negative_prompt_attention_mask = embedding_dict['negative_prompt_attention_mask'].to('cuda')
         return prompt_embeds, prompt_attention_masks, negative_prompt_embeds, negative_prompt_attention_mask
     else:
-        print("File not found. Precomputing prompt embeddings...")
+        if force_recompute and os.path.isfile(embedding_fname):
+            print("Force recompute enabled. Rebuilding prompt embeddings...")
+        else:
+            print("File not found. Precomputing prompt embeddings...")
         if pixart:
             with open(PIXART_TXT_FILE_LOC, 'r') as f:
                 prompt_list = [item.strip() for item in f.readlines()]

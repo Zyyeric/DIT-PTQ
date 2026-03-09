@@ -530,6 +530,9 @@ def main():
         "--pixart", action="store_true", default=False,
         help="generate images for 120 high-detailed pixart prompts (no ground truth)")
     parser.add_argument(
+        "--force_recompute_prompt_embeddings", action="store_true", default=False,
+        help="ignore cached prompt embedding files and regenerate them")
+    parser.add_argument(
     "--disable_fp_quant", action="store_true",
     help="Use integer quantization"
     )
@@ -617,6 +620,7 @@ def main():
     pes, pams, npe, npam = None, None, None, None
     if opt.prompt is None and (is_main_process or do_parallel_generate):
         pes, pams, npe, npam = get_captions("alpha", model, 
+                            force_recompute=opt.force_recompute_prompt_embeddings,
                             coco_1k=opt.coco_1k,
                             coco_9k=opt.coco_9k,
                             coco_10k=opt.coco_10k,
