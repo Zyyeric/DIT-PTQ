@@ -799,7 +799,8 @@ def main():
                 # Initialize activation quantization parameters
                 qnn.set_quant_state(enable_weight_quant, True)
                 with torch.no_grad():
-                    inds = np.random.choice(cali_xs.shape[0], 16, replace=False)
+                    init_bs = min(16, cali_xs.shape[0])
+                    inds = np.random.choice(cali_xs.shape[0], init_bs, replace=False)
                     _ = qnn(
                         cali_xs[inds],
                         timestep=cali_ts[inds],
@@ -811,12 +812,13 @@ def main():
                         inds = np.arange(cali_xs.shape[0])
                         np.random.shuffle(inds)
                         qnn.set_running_stat(True, opt.rs_sm_only)
-                        for i in trange(int(cali_xs.size(0) / 16), disable=opt.nvtx_profile):
+                        for start in trange(0, cali_xs.size(0), 16, disable=opt.nvtx_profile):
+                            end = min(start + 16, cali_xs.size(0))
                             _ = qnn(
-                                cali_xs[inds[i * 16:(i + 1) * 16]],
-                                timestep=cali_ts[inds[i * 16:(i + 1) * 16]],
-                                encoder_hidden_states=cali_cs[inds[i * 16:(i + 1) * 16]],
-                                added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[inds[i * 16:(i + 1) * 16]]),
+                                cali_xs[inds[start:end]],
+                                timestep=cali_ts[inds[start:end]],
+                                encoder_hidden_states=cali_cs[inds[start:end]],
+                                added_cond_kwargs=pixart_alpha_aca_dict(cali_xs[inds[start:end]]),
                             )
                         qnn.set_running_stat(False, opt.rs_sm_only)
 
@@ -828,9 +830,10 @@ def main():
                 recon_model(qnn)
                 qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=True)
             elif enable_act_quant:
-                # To be implement
-                logger.info("Doing online activation calibration")
-                qnn.set_quant_state(weight_quant=enable_weight_quant, act_quant=True)
+                raise NotImplementedError(
+                    "Online activation quantization is not implemented. "
+                    "Use --disable_online_act_quant for the supported offline activation calibration path."
+                )
             # Currently, this does not work
             """
             print("Report delta change")
@@ -850,7 +853,8 @@ def main():
                             m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                         else:
                             m.zero_point = nn.Parameter(m.zero_point)
-            #torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
+            if is_main_process:
+                torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
 
         qnn = qnn.to(device=device, dtype=torch.float16)
         model.transformer = qnn

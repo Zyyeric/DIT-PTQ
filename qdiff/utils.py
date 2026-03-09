@@ -632,13 +632,25 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
         elif len(cali_data) == 4:
             # TODO fix when required.
             with torch.no_grad():
-                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
+                cali_xs_cuda = cali_xs[:2].cuda()
+                _ = qnn(
+                    cali_xs_cuda,
+                    timestep=cali_ts[:2].cuda(),
+                    encoder_hidden_states=cali_cs[:2].cuda(),
+                    added_cond_kwargs=pixart_alpha_aca_dict(cali_xs_cuda),
+                )
         else:
             # NOTE this is what is used by PixArt
             cali_xs = cali_xs.to(torch.float16)
             cali_cs = cali_cs.to(torch.float16)
             with torch.no_grad():
-                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
+                cali_xs_cuda = cali_xs[:2].cuda()
+                _ = qnn(
+                    cali_xs_cuda,
+                    timestep=cali_ts[:2].cuda(),
+                    encoder_hidden_states=cali_cs[:2].cuda(),
+                    added_cond_kwargs=pixart_alpha_aca_dict(cali_xs_cuda),
+                )
         # change weight quantizer from uniform to adaround
         # e.g., prior to calling convert adaround, must pass data through.
         # this generates deltas in weights - the distribution of cali data does not matter.
@@ -685,13 +697,25 @@ def resume_cali_model(qnn, ckpt_path, cali_data, quant_act=False, act_quant_mode
             cali_cs = cali_data['cs'][0].to(torch.float16)
             # If you do not wrap in torch.no_grad, V100 runs out of VRAM.
             with torch.no_grad():
-                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
+                cali_xs_cuda = cali_xs[:2].cuda()
+                _ = qnn(
+                    cali_xs_cuda,
+                    timestep=cali_ts[:2].cuda(),
+                    encoder_hidden_states=cali_cs[:2].cuda(),
+                    added_cond_kwargs=pixart_alpha_aca_dict(cali_xs_cuda),
+                )
         else:
             # NOTE PixArt
             cali_xs = cali_xs.to(torch.float16)
             cali_cs = cali_cs.to(torch.float16)
             with torch.no_grad():
-                _ = qnn(cali_xs[:2].cuda(), timestep=cali_ts[:2].cuda(), encoder_hidden_states=cali_cs[:2].cuda(), added_cond_kwargs = pixart_alpha_aca_dict(cali_xs[:2]))
+                cali_xs_cuda = cali_xs[:2].cuda()
+                _ = qnn(
+                    cali_xs_cuda,
+                    timestep=cali_ts[:2].cuda(),
+                    encoder_hidden_states=cali_cs[:2].cuda(),
+                    added_cond_kwargs=pixart_alpha_aca_dict(cali_xs_cuda),
+                )
         print("Loading quantized model checkpoint again")
         
         for m in qnn.model.modules():
