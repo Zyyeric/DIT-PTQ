@@ -98,37 +98,42 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
     cached_inps, cached_outs = None, None
     torch.cuda.empty_cache()
 
-    def alloc_like_cpu(value, total):
+    def append_like_cpu(storage, value):
         if value is None:
-            return None
+            return storage
         if torch.is_tensor(value):
-            return torch.empty((total, *value.shape[1:]), dtype=value.dtype, device='cpu')
+            if storage is None:
+                storage = []
+            storage.append(value.detach().cpu())
+            return storage
         if isinstance(value, tuple):
-            return tuple(alloc_like_cpu(v, total) for v in value)
-        if isinstance(value, list):
-            return [None] * total
-        return [None] * total
-
-    def store_like_cpu(storage, value, start, end):
-        if storage is None or value is None:
-            return
-        if torch.is_tensor(storage):
-            storage[start:end].copy_(value.detach().cpu())
-            return
-        if isinstance(storage, tuple):
-            for s, v in zip(storage, value):
-                store_like_cpu(s, v, start, end)
-            return
-        if isinstance(storage, list):
-            if torch.is_tensor(value):
-                cpu_value = value.detach().cpu()
-                for offset, item in enumerate(cpu_value):
-                    storage[start + offset] = item
-            elif isinstance(value, list):
-                storage[start:end] = value
+            if storage is None:
+                storage = tuple(append_like_cpu(None, v) for v in value)
             else:
-                for idx in range(start, end):
-                    storage[idx] = value
+                storage = tuple(append_like_cpu(s, v) for s, v in zip(storage, value))
+            return storage
+        if isinstance(value, list):
+            if storage is None:
+                storage = []
+            storage.extend(value)
+            return storage
+        if storage is None:
+            storage = []
+        storage.append(value)
+        return storage
+
+    def finalize_cpu_storage(storage):
+        if storage is None:
+            return None
+        if isinstance(storage, tuple):
+            return tuple(finalize_cpu_storage(v) for v in storage)
+        if isinstance(storage, list):
+            if not storage:
+                return storage
+            if torch.is_tensor(storage[0]):
+                return torch.cat(storage, dim=0)
+            return storage
+        return storage
 
     def move_storage_to_device(storage, dst_device):
         if storage is None:
@@ -203,19 +208,16 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
                 cali_ts[inds[start:end]].to(device),
                 cali_conds[inds[start:end]].to(device)
             )
-        if cached_inps is None:
-            cached_inps = alloc_like_cpu(cur_inp, total)
-        if cached_outs is None:
-            cached_outs = alloc_like_cpu(cur_out, total)
-
-        store_like_cpu(cached_inps, cur_inp, start, end)
-        store_like_cpu(cached_outs, cur_out, start, end)
+        cached_inps = append_like_cpu(cached_inps, cur_inp)
+        cached_outs = append_like_cpu(cached_outs, cur_out)
     
     #if isinstance(cached_inps, list):
     #    logger.info(f"in 1 shape: {cached_inps[0].shape}, in 2 shape: {cached_inps[1].shape}")
     #else:
     #    logger.info(f"in shape: {cached_inps.shape}")
     #logger.info(f"out shape: {cached_outs.shape}")
+    cached_inps = finalize_cpu_storage(cached_inps)
+    cached_outs = finalize_cpu_storage(cached_outs)
     torch.cuda.empty_cache()
     if keep_gpu:
         cached_inps = move_storage_to_device(cached_inps, device)

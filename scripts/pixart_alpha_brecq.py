@@ -597,6 +597,12 @@ def main():
 
 
     from diffusers import PixArtAlphaPipeline
+    from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+
+    # Diffusers 0.29.2 resolves `_execution_device` through `components`, which
+    # becomes fragile after swapping in the quantized transformer. `device`
+    # already resolves from the active module set and is stable here.
+    DiffusionPipeline._execution_device = property(lambda self: self.device)
     model = PixArtAlphaPipeline.from_pretrained(
         "PixArt-alpha/PixArt-XL-2-1024-MS", torch_dtype=torch.float16
     ).to(device)
