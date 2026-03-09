@@ -595,8 +595,10 @@ class QuantModule(nn.Module):
         else:
             weight = self.org_weight
             bias = self.org_bias
-        if input.device != weight.device:
-            input = input.to(weight.device)
+        # Keep compute on the activation device. Some cached plain-tensor copies such as
+        # org_weight/org_bias are not registered parameters, so module.to(...) does not move them.
+        if weight.device != input.device:
+            weight = weight.to(input.device)
         if weight.dtype != input.dtype:
             weight = weight.to(input.dtype)
         if bias is not None and bias.device != input.device:

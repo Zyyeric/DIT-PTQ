@@ -38,6 +38,50 @@ def list_images(root: str) -> List[Path]:
     return files
 
 
+def resolve_coco_reference_images(
+    real_dir: str,
+    captions_json: str,
+    caption_mode: str,
+    num_images: int,
+) -> List[Path]:
+    with open(captions_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    annotations = data["annotations"]
+    if caption_mode == "coco_10k":
+        selected = annotations[:10000]
+    elif caption_mode == "coco_9k":
+        selected = annotations[1000:10000]
+    elif caption_mode == "coco_1k":
+        selected = annotations[:1000]
+    else:
+        raise ValueError(f"Unsupported caption_mode: {caption_mode}")
+
+    if len(selected) < num_images:
+        raise RuntimeError(
+            f"Resolved {len(selected)} COCO annotations for mode {caption_mode}, but {num_images} generated images were found."
+        )
+
+    image_id_to_name = {}
+    for img in data.get("images", []):
+        image_id_to_name[img["id"]] = img["file_name"]
+
+    real_root = Path(real_dir)
+    paths = []
+    for ann in selected[:num_images]:
+        image_id = ann["image_id"]
+        file_name = image_id_to_name.get(image_id)
+        if file_name is None:
+            file_name = f"{int(image_id):012d}.jpg"
+        path = real_root / file_name
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Reference image for annotation image_id={image_id} was not found: {path}"
+            )
+        paths.append(path)
+    return paths
+
+
 def materialize_image_subset(paths: List[Path], target_dir: str) -> None:
     for idx, path in enumerate(paths):
         dst = Path(target_dir) / f"{idx:06d}{path.suffix.lower()}"
@@ -290,6 +334,11 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_gen_images", type=int, default=None)
     parser.add_argument("--max_real_images", type=int, default=None)
+    parser.add_argument(
+        "--align_real_to_coco_annotations",
+        action="store_true",
+        help="Resolve real reference images from COCO caption annotations so generated index i is compared to annotation i.",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--fid_backend",
@@ -321,11 +370,22 @@ def main():
     device = torch.device(args.device)
 
     gen_images = list_images(args.gen_dir)
-    real_images = list_images(args.real_dir)
     if args.max_gen_images is not None:
         gen_images = gen_images[: args.max_gen_images]
-    if args.max_real_images is not None:
-        real_images = real_images[: args.max_real_images]
+
+    if args.align_real_to_coco_annotations:
+        if args.captions_json is None:
+            raise RuntimeError("--align_real_to_coco_annotations requires --captions_json.")
+        real_images = resolve_coco_reference_images(
+            real_dir=args.real_dir,
+            captions_json=args.captions_json,
+            caption_mode=args.caption_mode,
+            num_images=len(gen_images),
+        )
+    else:
+        real_images = list_images(args.real_dir)
+        if args.max_real_images is not None:
+            real_images = real_images[: args.max_real_images]
 
     if len(gen_images) < 2 or len(real_images) < 2:
         raise RuntimeError("Need at least 2 generated and 2 real images to compute FID.")

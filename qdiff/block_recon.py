@@ -154,13 +154,13 @@ def block_reconstruction(model: QuantModel, block: BaseQuantBlock, cali_data: to
                 idx = torch.randperm(cached_inps[0].size(0), generator=rng)[:batch_size]
                 if len(cached_inps) == 8:
                     cur_x = cached_inps[0][idx].to(device, torch.float32)
-                    cur_am = cached_inps[1][idx].to(device, torch.float32) if type(cached_inps[1]) == torch.Tensor else None
-                    cur_ehs = cached_inps[2][idx].to(device, torch.float32) if type(cached_inps[2]) == torch.Tensor else None
-                    cur_eam = cached_inps[3][idx].to(device, torch.float32) if type(cached_inps[3]) == torch.Tensor else None
-                    cur_ts = cached_inps[4][idx].to(device) if type(cached_inps[4]) == torch.Tensor else None
-                    cur_cak = cached_inps[5][idx] if cached_inps[5][0] is not None else None
-                    cur_cl = cached_inps[6][idx].to(device) if type(cached_inps[6]) == torch.Tensor else None
-                    cur_ack = cached_inps[7][idx].to(device) if type(cached_inps[7]) == torch.Tensor else None
+                    cur_am = cached_inps[1][idx].to(device, torch.float32) if torch.is_tensor(cached_inps[1]) else None
+                    cur_ehs = cached_inps[2][idx].to(device, torch.float32) if torch.is_tensor(cached_inps[2]) else None
+                    cur_eam = cached_inps[3][idx].to(device, torch.float32) if torch.is_tensor(cached_inps[3]) else None
+                    cur_ts = cached_inps[4][idx].to(device) if torch.is_tensor(cached_inps[4]) else None
+                    cur_cak = cached_inps[5][idx] if cached_inps[5] is not None else None
+                    cur_cl = cached_inps[6][idx].to(device) if torch.is_tensor(cached_inps[6]) else None
+                    cur_ack = cached_inps[7][idx].to(device) if torch.is_tensor(cached_inps[7]) else None
                     cur_inp = (cur_x, cur_am, cur_ehs, cur_eam, cur_ts, cur_cak, cur_cl, cur_ack)
                 else:
                     cur_x = cached_inps[0][idx].to(device)

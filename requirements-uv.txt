@@ -3,12 +3,12 @@
 #   uv venv -p 3.9
 #   source .venv/bin/activate
 #   uv pip install --upgrade pip
-#   uv pip install --extra-index-url https://download.pytorch.org/whl/cu117 -r requirements-uv.txt
+#   uv pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements-uv.txt
 
 # PyTorch stack (CUDA 11.7)
-torch==1.13.1+cu117
-torchvision==0.14.1+cu117
-torchaudio==0.13.1
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torchaudio==2.5.1+cu121
 
 # Base dependencies
 numpy<2
