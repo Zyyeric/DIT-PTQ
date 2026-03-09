@@ -649,6 +649,8 @@ def main():
         enable_act_quant = opt.quant_act or opt.act_only
         if opt.weight_only:
             enable_act_quant = False
+        weight_ckpt_name = f"W{opt.weight_bit}_ckpt.pth"
+        final_ckpt_name = f"W{opt.weight_bit}A{opt.act_bit}_ckpt.pth"
 
         wq_params = {'n_bits': opt.weight_bit, 'channel_wise': True, 'scale_method': 'mse', 'fp': True, 
                     'mantissa_bits': opt.weight_mantissa_bits,
@@ -796,7 +798,7 @@ def main():
                             else:
                                 m.zero_point = nn.Parameter(m.zero_point)
                 if is_main_process:
-                    torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt_wq.pth"))
+                    torch.save(qnn.state_dict(), os.path.join(outpath, weight_ckpt_name))
                 logger.info(model.transformer)
             if enable_act_quant and opt.disable_online_act_quant:
                 logger.info("UNet model")
@@ -859,8 +861,8 @@ def main():
                             m.zero_point = nn.Parameter(torch.tensor(float(m.zero_point)))
                         else:
                             m.zero_point = nn.Parameter(m.zero_point)
-            if is_main_process:
-                torch.save(qnn.state_dict(), os.path.join(outpath, "ckpt.pth"))
+            if enable_act_quant and is_main_process:
+                torch.save(qnn.state_dict(), os.path.join(outpath, final_ckpt_name))
 
         qnn = qnn.to(device=device, dtype=torch.float16)
         model.transformer = qnn

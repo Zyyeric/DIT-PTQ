@@ -1,10 +1,45 @@
 import os
+import json
 import torch
 
 PIXART_TXT_FILE_LOC = os.sep.join(["captions", "pixart_samples.txt"])
 COCO_VAL_CAPTIONS = os.sep.join(["captions", "captions_val2017.json"])
 COCO_2014_CAPTIONS = os.sep.join(["captions", "annots_10k.txt"])
 HPSV2_CAPTIONS = os.sep.join(["captions", "hpsv2.txt"])
+
+
+def get_coco_subset_spec(coco_9k=False, coco_10k=False):
+    if coco_9k:
+        return {"skip": 1000, "take": 9000}
+    if coco_10k:
+        return {"skip": 0, "take": 10000}
+    return {"skip": 0, "take": 1000}
+
+
+def resolve_coco_unique_captions(coco_9k=False, coco_10k=False):
+    spec = get_coco_subset_spec(coco_9k=coco_9k, coco_10k=coco_10k)
+    with open(COCO_VAL_CAPTIONS) as f:
+        captions = json.load(f)
+
+    unique_captions = []
+    seen_image_ids = set()
+    for ann in captions["annotations"]:
+        image_id = ann["image_id"]
+        if image_id in seen_image_ids:
+            continue
+        seen_image_ids.add(image_id)
+        unique_captions.append(ann["caption"])
+        if len(unique_captions) >= spec["skip"] + spec["take"]:
+            break
+
+    start = spec["skip"]
+    end = start + spec["take"]
+    selected = unique_captions[start:end]
+    if len(selected) < spec["take"]:
+        raise RuntimeError(
+            f"Resolved only {len(selected)} unique COCO captions; expected {spec['take']}."
+        )
+    return selected
 
 
 def get_captions(name, model, coco_9k=False, coco_10k=False, pixart=False, coco2014=False, hpsv2=False):
@@ -50,8 +85,8 @@ def get_captions(name, model, coco_9k=False, coco_10k=False, pixart=False, coco2
         prompt_embeds = embedding_dict['prompt_embeds']
         prompt_attention_masks = embedding_dict['prompt_attention_masks']
         if coco_9k:
-            prompt_embeds = prompt_embeds[1000:]
-            prompt_attention_masks = prompt_attention_masks[1000:]
+            prompt_embeds = prompt_embeds[1000:10000]
+            prompt_attention_masks = prompt_attention_masks[1000:10000]
         elif not pixart and not coco_10k and not coco2014 and not hpsv2: # coco_1k
             prompt_embeds = prompt_embeds[:1000]
             prompt_attention_masks = prompt_attention_masks[:1000]
@@ -70,19 +105,7 @@ def get_captions(name, model, coco_9k=False, coco_10k=False, pixart=False, coco2
             with open(HPSV2_CAPTIONS, 'r') as f:
                 prompt_list = [item.strip() for item in f.readlines()]
         else:
-            import json
-            with open(COCO_VAL_CAPTIONS) as f:
-                captions = json.load(f)
-            captions_list = captions['annotations'][:10000]
-            """
-            if coco_10k:
-                captions_list = captions_list[:10000]
-            elif coco_9k:
-                captions_list = captions_list[1000:10000]
-            else:
-                captions_list = captions_list[:1000]
-            """
-            prompt_list = [c['caption'] for c in captions_list]
+            prompt_list = resolve_coco_unique_captions(coco_9k=coco_9k, coco_10k=coco_10k)
             
         pes, pams, npe, npam = [], [], None, None
         with torch.no_grad():
@@ -108,12 +131,7 @@ def get_captions(name, model, coco_9k=False, coco_10k=False, pixart=False, coco2
         print("Save successful!")
         npe = npe.to("cuda")
         npam = npam.to("cuda")
-        if coco_9k:
-            return pes[1000:], pams[1000:], npe, npam
-        elif not pixart and not coco_10k and not coco2014 and not hpsv2:
-            return pes[:1000], pams[:1000], npe, npam
-        else:
-            return pes, pams, npe, npam
+        return pes, pams, npe, npam
 
             
 if __name__ == "__main__":
