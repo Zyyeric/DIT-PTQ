@@ -94,7 +94,17 @@ def layer_reconstruction(model: QuantModel, layer: QuantModule, cali_data: torch
     # cached_inps, cached_outs = save_inp_oup_data(
     #     model, layer, cali_data, asym, act_quant, batch_size, keep_gpu=False, cond=cond, is_sm=is_sm)
     cached_inps, cached_outs = save_inp_oup_data(
-        model, layer, cali_data, asym, act_quant, weight_quant, 8, keep_gpu=False, cond=cond, is_sm=is_sm)
+        model,
+        layer,
+        cali_data,
+        asym,
+        act_quant,
+        weight_quant,
+        batch_size,
+        keep_gpu=False,
+        cond=cond,
+        is_sm=is_sm,
+    )
     if opt_mode != 'mse':
         cached_grads = save_grad_data(
             model, layer, cali_data, act_quant=act_quant, batch_size=batch_size, weight_quant=weight_quant

@@ -23,6 +23,8 @@ dependencies:
     - torch-fidelity==0.3.0
     - clean-fid==0.1.35
     - image-reward==1.5
+    - datasets==4.5.0
+    - pyarrow==21.0.0
     - torchmetrics==0.6.0
     - streamlit-drawable-canvas==0.8
     - einops==0.3.0

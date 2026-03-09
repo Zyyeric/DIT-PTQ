@@ -34,6 +34,34 @@ def get_dist_world_size() -> int:
     return dist.get_world_size()
 
 
+def _cali_data_length(cali_data) -> int:
+    if torch.is_tensor(cali_data):
+        return int(cali_data.size(0))
+    if isinstance(cali_data, (tuple, list)) and cali_data:
+        return int(cali_data[0].size(0))
+    raise TypeError(f"Unsupported calibration data type: {type(cali_data)!r}")
+
+
+def _slice_cali_data(cali_data, start: int, end: int):
+    if torch.is_tensor(cali_data):
+        return cali_data[start:end]
+    if isinstance(cali_data, tuple):
+        return tuple(item[start:end] if torch.is_tensor(item) else item for item in cali_data)
+    if isinstance(cali_data, list):
+        return [item[start:end] if torch.is_tensor(item) else item for item in cali_data]
+    raise TypeError(f"Unsupported calibration data type: {type(cali_data)!r}")
+
+
+def _model_output_tensor(output):
+    if torch.is_tensor(output):
+        return output
+    if isinstance(output, (tuple, list)) and output:
+        return _model_output_tensor(output[0])
+    if hasattr(output, "sample"):
+        return output.sample
+    raise TypeError(f"Unsupported model output type: {type(output)!r}")
+
+
 def sync_grads(opt_params):
     if not is_dist_initialized():
         return
@@ -152,34 +180,33 @@ def save_inp_oup_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBloc
             logger.info("Nope. Using normal caching method")
     
     
-    num = int(cali_xs.size(0) / batch_size)
+    total = int(cali_xs.size(0))
     if is_sm:
-        num //= 2
-    for i in trange(num):
-        start = i * batch_size
-        end = start + batch_size
+        total = len(inds)
+    for start in trange(0, total, batch_size):
+        end = min(start + batch_size, total)
         if not cond:
             cur_inp, cur_out = get_inp_out(
-                cali_xs[i * batch_size:(i + 1) * batch_size].to(device), 
-                cali_ts[i * batch_size:(i + 1) * batch_size].to(device)
+                cali_xs[start:end].to(device), 
+                cali_ts[start:end].to(device)
             ) if not is_sm else get_inp_out(
-                cali_xs[inds[i * batch_size:(i + 1) * batch_size]].to(device), 
-                cali_ts[inds[i * batch_size:(i + 1) * batch_size]].to(device)
+                cali_xs[inds[start:end]].to(device), 
+                cali_ts[inds[start:end]].to(device)
             )
         else:
             cur_inp, cur_out = get_inp_out(
-                cali_xs[i * batch_size:(i + 1) * batch_size].to(device), 
-                cali_ts[i * batch_size:(i + 1) * batch_size].to(device),
-                cali_conds[i * batch_size:(i + 1) * batch_size].to(device)
+                cali_xs[start:end].to(device), 
+                cali_ts[start:end].to(device),
+                cali_conds[start:end].to(device)
             ) if not is_sm else get_inp_out(
-                cali_xs[inds[i * batch_size:(i + 1) * batch_size]].to(device), 
-                cali_ts[inds[i * batch_size:(i + 1) * batch_size]].to(device),
-                cali_conds[inds[i * batch_size:(i + 1) * batch_size]].to(device)
+                cali_xs[inds[start:end]].to(device), 
+                cali_ts[inds[start:end]].to(device),
+                cali_conds[inds[start:end]].to(device)
             )
         if cached_inps is None:
-            cached_inps = alloc_like_cpu(cur_inp, batch_size * num)
+            cached_inps = alloc_like_cpu(cur_inp, total)
         if cached_outs is None:
-            cached_outs = alloc_like_cpu(cur_out, batch_size * num)
+            cached_outs = alloc_like_cpu(cur_out, total)
 
         store_like_cpu(cached_inps, cur_inp, start, end)
         store_like_cpu(cached_outs, cur_out, start, end)
@@ -218,8 +245,10 @@ def save_grad_data(model: QuantModel, layer: Union[QuantModule, BaseQuantBlock],
     cached_batches = []
     torch.cuda.empty_cache()
 
-    for i in range(int(cali_data.size(0) / batch_size)):
-        cur_grad = get_grad(cali_data[i * batch_size:(i + 1) * batch_size])
+    total = _cali_data_length(cali_data)
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        cur_grad = get_grad(_slice_cali_data(cali_data, start, end))
         cached_batches.append(cur_grad.cpu())
 
     cached_grads = torch.cat([x for x in cached_batches])
@@ -372,11 +401,69 @@ class GetLayerGrad:
         with torch.enable_grad():
             try:
                 self.model.zero_grad()
-                inputs = model_input.to(self.device)
                 self.model.set_quant_state(False, False)
-                out_fp = self.model(inputs)
-                quantize_model_till(self.model, self.layer, self.act_quant, self.weight_quant)
-                out_q = self.model(inputs)
+                if torch.is_tensor(model_input):
+                    inputs = model_input.to(self.device)
+                    out_fp = self.model(inputs)
+                    quantize_model_till(self.model, self.layer, self.act_quant, self.weight_quant)
+                    out_q = self.model(inputs)
+                elif isinstance(model_input, (tuple, list)):
+                    if len(model_input) == 2:
+                        x, timesteps = model_input
+                        x = x.to(self.device)
+                        timesteps = timesteps.to(self.device)
+                        out_fp = self.model(x, timesteps)
+                        quantize_model_till(self.model, self.layer, self.act_quant, self.weight_quant)
+                        out_q = self.model(x, timesteps)
+                    elif len(model_input) == 3:
+                        x, timesteps, context = model_input
+                        x = x.to(self.device)
+                        timesteps = timesteps.to(self.device)
+                        context = context.to(self.device)
+                        out_fp = self.model(
+                            x,
+                            timestep=timesteps,
+                            encoder_hidden_states=context,
+                            added_cond_kwargs=pixart_alpha_aca_dict(x),
+                        )
+                        quantize_model_till(self.model, self.layer, self.act_quant, self.weight_quant)
+                        out_q = self.model(
+                            x,
+                            timestep=timesteps,
+                            encoder_hidden_states=context,
+                            added_cond_kwargs=pixart_alpha_aca_dict(x),
+                        )
+                    elif len(model_input) == 5:
+                        x, timesteps, context, text_embeds, time_ids = model_input
+                        x = x.to(self.device)
+                        timesteps = timesteps.to(self.device)
+                        context = context.to(self.device)
+                        text_embeds = text_embeds.to(self.device)
+                        time_ids = time_ids.to(self.device)
+                        added_cond_kwargs = {"text_embeds": text_embeds, "time_ids": time_ids}
+                        out_fp = self.model(
+                            x,
+                            timesteps,
+                            encoder_hidden_states=context,
+                            added_cond_kwargs=added_cond_kwargs,
+                            cross_attention_kwargs={},
+                            return_dict=False,
+                        )
+                        quantize_model_till(self.model, self.layer, self.act_quant, self.weight_quant)
+                        out_q = self.model(
+                            x,
+                            timesteps,
+                            encoder_hidden_states=context,
+                            added_cond_kwargs=added_cond_kwargs,
+                            cross_attention_kwargs={},
+                            return_dict=False,
+                        )
+                    else:
+                        raise TypeError(f"Unsupported model_input length: {len(model_input)}")
+                else:
+                    raise TypeError(f"Unsupported model_input type: {type(model_input)!r}")
+                out_fp = _model_output_tensor(out_fp)
+                out_q = _model_output_tensor(out_q)
                 loss = F.kl_div(F.log_softmax(out_q, dim=1), F.softmax(out_fp, dim=1), reduction='batchmean')
                 loss.backward()
             except StopForwardException:

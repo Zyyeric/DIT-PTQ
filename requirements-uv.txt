@@ -3,7 +3,7 @@
 #   uv venv -p 3.9
 #   source .venv/bin/activate
 #   uv pip install --upgrade pip
-#   uv pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements-uv.txt
+#   uv pip install --extra-index-url https://download.pytorch.org/whl/cu121 --index-strategy unsafe-best-match -r requirements-uv.txt
 
 # PyTorch stack (CUDA 11.7)
 torch==2.5.1+cu121
@@ -23,6 +23,8 @@ streamlit>=0.73.1
 torch-fidelity==0.3.0
 clean-fid==0.1.35
 image-reward==1.5
+datasets==4.5.0
+pyarrow==21.0.0
 torchmetrics==0.6.0
 streamlit-drawable-canvas==0.8
 einops==0.3.0

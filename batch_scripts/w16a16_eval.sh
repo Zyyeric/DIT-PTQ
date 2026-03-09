@@ -14,13 +14,13 @@
 
 set -euo pipefail
 
-export REPO_DIR=/home/cia5572/DIT-PTQ
-export RUN_DIR=/scratch/cia5572/outputs/pixart_w16a16_eval/2026-03-06-23-45-49
+export REPO_DIR=/home/vxf1610/DIT-PTQ
+export RUN_DIR=/home/vxf1610/outputs/pixart_w16a16_eval/2026-03-06-23-45-49
 export COCO_ROOT=/scratch/cia5572/datasets/coco
 export TORCH_HOME=/scratch/cia5572/torch_cache
 export HF_HOME=/scratch/cia5572/hf_cache
-export HF_HOME=/scratch/cia5572/hf_cache
 export XDG_CACHE_HOME=/scratch/cia5572/.cache
+export CUDA_CACHE_PATH=/scratch/cia5572/.nv_cache
 
 export CAPTIONS_JSON="$REPO_DIR/captions/captions_val2017.json"
 export CAPTION_MODE=coco_10k
@@ -31,10 +31,9 @@ export BATCH_SIZE=32
 export CLIP_BATCH_SIZE=64
 export NUM_WORKERS=1
 export DEVICE=cuda
-export MAX_GEN_IMAGES=5000
-export MAX_REAL_IMAGES=5000
+export MAX_GEN_IMAGES=10000
 
-cd "$REPO_DIR"
+cd /home/vxf1610/DIT-PTQ
 source .venv/bin/activate
 
 GEN_DIR="$RUN_DIR/$SAMPLE_SUBDIR"
@@ -50,6 +49,7 @@ python scripts/eval_metrics.py \
   --real_dir "$REAL_DIR" \
   --captions_json "$CAPTIONS_JSON" \
   --caption_mode "$CAPTION_MODE" \
+  --align_real_to_coco_annotations \
   --batch_size "$BATCH_SIZE" \
   --clip_batch_size "$CLIP_BATCH_SIZE" \
   --num_workers "$NUM_WORKERS" \
@@ -57,5 +57,4 @@ python scripts/eval_metrics.py \
   --fid_backend "$FID_BACKEND" \
   --clean_fid_mode "$CLEAN_FID_MODE" \
   --max_gen_images "$MAX_GEN_IMAGES" \
-  --max_real_images "$MAX_REAL_IMAGES" \
   --save_json "$SAVE_JSON"
