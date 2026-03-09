@@ -512,11 +512,14 @@ def main():
     help="Disable online activation quantization"
     )
     parser.add_argument(
+        "--coco_1k", action="store_true", default=False,
+        help="generate images for the first 1000 unique COCO val image captions")
+    parser.add_argument(
         "--coco_9k", action="store_true", default=False,
-        help="generate images for coco val prompts 1000-9999")
+        help="generate images for unique COCO val image captions 1000-9999")
     parser.add_argument(
         "--coco_10k", action="store_true", default=False,
-        help="generate images for coco val prompts 0-9999")
+        help="generate images for the first 10000 unique COCO val image captions")
     parser.add_argument(
         "--coco2014", action="store_true", default=False,
         help="generate images for coco 2014 prompts 0-9999")
@@ -608,9 +611,13 @@ def main():
     ).to(device)
 
     from qdiff.caption_util import get_captions
+    coco_subset_flags = [opt.coco_1k, opt.coco_9k, opt.coco_10k]
+    if sum(bool(flag) for flag in coco_subset_flags) > 1:
+        raise ValueError("At most one of --coco_1k, --coco_9k, or --coco_10k may be set.")
     pes, pams, npe, npam = None, None, None, None
     if opt.prompt is None and (is_main_process or do_parallel_generate):
         pes, pams, npe, npam = get_captions("alpha", model, 
+                            coco_1k=opt.coco_1k,
                             coco_9k=opt.coco_9k,
                             coco_10k=opt.coco_10k,
                             coco2014=opt.coco2014,
@@ -625,7 +632,9 @@ def main():
             pams = pams[:n_prompts]
         model.text_encoder = model.text_encoder.to("cpu")
 
-    if opt.coco_9k:
+    if opt.coco_1k:
+        sp = "samples_1k"
+    elif opt.coco_9k:
         sp = "samples_9k"
     elif opt.coco_10k:
         sp = "samples_10k"

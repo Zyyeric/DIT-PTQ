@@ -8,7 +8,9 @@ COCO_2014_CAPTIONS = os.sep.join(["captions", "annots_10k.txt"])
 HPSV2_CAPTIONS = os.sep.join(["captions", "hpsv2.txt"])
 
 
-def get_coco_subset_spec(coco_9k=False, coco_10k=False):
+def get_coco_subset_spec(coco_1k=False, coco_9k=False, coco_10k=False):
+    if coco_1k:
+        return {"skip": 0, "take": 1000}
     if coco_9k:
         return {"skip": 1000, "take": 9000}
     if coco_10k:
@@ -16,8 +18,8 @@ def get_coco_subset_spec(coco_9k=False, coco_10k=False):
     return {"skip": 0, "take": 1000}
 
 
-def resolve_coco_unique_captions(coco_9k=False, coco_10k=False):
-    spec = get_coco_subset_spec(coco_9k=coco_9k, coco_10k=coco_10k)
+def resolve_coco_unique_captions(coco_1k=False, coco_9k=False, coco_10k=False):
+    spec = get_coco_subset_spec(coco_1k=coco_1k, coco_9k=coco_9k, coco_10k=coco_10k)
     with open(COCO_VAL_CAPTIONS) as f:
         captions = json.load(f)
 
@@ -42,33 +44,45 @@ def resolve_coco_unique_captions(coco_9k=False, coco_10k=False):
     return selected
 
 
-def get_captions(name, model, coco_9k=False, coco_10k=False, pixart=False, coco2014=False, hpsv2=False):
+def get_captions(name, model, coco_1k=False, coco_9k=False, coco_10k=False, pixart=False, coco2014=False, hpsv2=False):
     if pixart:
+        assert not coco_1k
         assert not coco_9k
         assert not coco_10k
         assert not coco2014
         assert not hpsv2
         tag = "_".join([name, "pixart"])
+    elif coco_1k:
+        assert not coco_9k
+        assert not coco_10k
+        assert not pixart
+        assert not coco2014
+        assert not hpsv2
+        tag = "_".join([name, "coco_10k"])
     elif coco_9k:
         assert not coco_10k
+        assert not coco_1k
         assert not pixart
         assert not coco2014
         assert not hpsv2
         tag = "_".join([name, "coco_10k"])
     elif coco_10k:
         assert not coco_9k
+        assert not coco_1k
         assert not pixart
         assert not coco2014
         assert not hpsv2
         tag = "_".join([name, "coco_10k"])
     elif coco2014:
         assert not coco_9k
+        assert not coco_1k
         assert not pixart
         assert not coco_10k
         assert not hpsv2
         tag = "_".join([name, "coco2014"])
     elif hpsv2:
         assert not coco_9k
+        assert not coco_1k
         assert not pixart
         assert not coco_10k
         assert not coco2014
@@ -84,7 +98,10 @@ def get_captions(name, model, coco_9k=False, coco_10k=False, pixart=False, coco2
         embedding_dict = torch.load(embedding_fname, map_location="cpu")
         prompt_embeds = embedding_dict['prompt_embeds']
         prompt_attention_masks = embedding_dict['prompt_attention_masks']
-        if coco_9k:
+        if coco_1k:
+            prompt_embeds = prompt_embeds[:1000]
+            prompt_attention_masks = prompt_attention_masks[:1000]
+        elif coco_9k:
             prompt_embeds = prompt_embeds[1000:10000]
             prompt_attention_masks = prompt_attention_masks[1000:10000]
         elif not pixart and not coco_10k and not coco2014 and not hpsv2: # coco_1k
@@ -105,7 +122,7 @@ def get_captions(name, model, coco_9k=False, coco_10k=False, pixart=False, coco2
             with open(HPSV2_CAPTIONS, 'r') as f:
                 prompt_list = [item.strip() for item in f.readlines()]
         else:
-            prompt_list = resolve_coco_unique_captions(coco_9k=coco_9k, coco_10k=coco_10k)
+            prompt_list = resolve_coco_unique_captions(coco_1k=coco_1k, coco_9k=coco_9k, coco_10k=coco_10k)
             
         pes, pams, npe, npam = [], [], None, None
         with torch.no_grad():
