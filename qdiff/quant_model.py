@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 class QuantModel(nn.Module):
 
+class QuantModel(nn.Module):
+
     def __init__(self, model: nn.Module, weight_quant_params: dict = {}, act_quant_params: dict = {}, **kwargs):
         super().__init__()
         self.model = model
@@ -25,8 +27,6 @@ class QuantModel(nn.Module):
         self.specials = get_specials(act_quant_params['leaf_param'])
 
         # Hacked changes for SDXL
-        if hasattr(model, "dtype"):
-            self.dtype=model.dtype
         if hasattr(model, "config"):
             self.config = model.config
             if hasattr(model, "add_embedding"):
@@ -41,8 +41,15 @@ class QuantModel(nn.Module):
         self.set_attn_weight_mantissa_bits(weight_quant_params)
         self.set_ff1_weight_mantissa_bits(weight_quant_params)
         self.set_asym_for_sm(act_quant_params)
-        
 
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+        
     # Only support for QuantDiffBTB softmax
     # Change the sign_bits to 0, mantissa remain unchange
     # Hence exponent bit plus one
