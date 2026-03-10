@@ -1,6 +1,8 @@
 import argparse
+import datetime
 import json
 import math
+import time
 from pathlib import Path
 from typing import List, Tuple
 
@@ -15,6 +17,16 @@ from torchvision.transforms import functional as TF
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+
+def _now():
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+def log(msg):
+    print(f"[{_now()}] {msg}", flush=True)
+
+def elapsed(t0):
+    return f"{time.time() - t0:.1f}s"
 
 
 def sort_key(path: Path):
@@ -95,6 +107,8 @@ def running_stats_from_paths(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
     ds = ImageDataset(paths)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate)
+    log(f"  Extracting Inception features: {len(paths)} images, {len(dl)} batches (batch_size={batch_size})")
+    t0 = time.time()
 
     sum_pool = None
     sum_outer_pool = None
@@ -105,7 +119,9 @@ def running_stats_from_paths(
     n_spatial = 0
 
     with torch.no_grad():
-        for imgs, _ in dl:
+        for batch_idx, (imgs, _) in enumerate(dl):
+            if batch_idx % 10 == 0:
+                log(f"    Batch {batch_idx+1}/{len(dl)}...")
             imgs = imgs.to(device, non_blocking=True)
             imgs = F.interpolate(imgs, size=(299, 299), mode="bilinear", align_corners=False, antialias=True)
             imgs = (imgs - mean) / std
@@ -134,6 +150,7 @@ def running_stats_from_paths(
     cov_pool = (sum_outer_pool - n_pool * np.outer(mu_pool, mu_pool)) / max(n_pool - 1, 1)
     mu_spatial = sum_spatial / n_spatial
     cov_spatial = (sum_outer_spatial - n_spatial * np.outer(mu_spatial, mu_spatial)) / max(n_spatial - 1, 1)
+    log(f"  Done in {elapsed(t0)}: n_pool={n_pool}  n_spatial={n_spatial}")
     return mu_pool, cov_pool, mu_spatial, cov_spatial, n_pool, n_spatial
 
 
@@ -188,9 +205,15 @@ def compute_clip_score(
     model, preprocess = clip.load("ViT-B/32", device=device, jit=False)
     model.eval()
 
+    n_batches = (len(image_paths) + batch_size - 1) // batch_size
+    log(f"  Computing CLIP scores: {len(image_paths)} images, {n_batches} batches")
+    t0 = time.time()
     all_cos = []
     with torch.no_grad():
         for i in range(0, len(image_paths), batch_size):
+            batch_num = i // batch_size + 1
+            if batch_num % 10 == 0:
+                log(f"    CLIP batch {batch_num}/{n_batches}...")
             chunk_paths = image_paths[i:i + batch_size]
             chunk_prompts = prompts[i:i + batch_size]
 
@@ -211,6 +234,7 @@ def compute_clip_score(
     cos_all = torch.cat(all_cos, dim=0).float()
     mean_cos = float(cos_all.mean().item())
     clip_score = float(max(mean_cos, 0.0) * 100.0)
+    log(f"  CLIP done in {elapsed(t0)}: mean_cos={mean_cos:.4f}  score={clip_score:.2f}")
     return mean_cos, clip_score
 
 
@@ -239,27 +263,61 @@ def main():
 
     device = torch.device(args.device)
 
+    log("=" * 60)
+    log("Eval Metrics")
+    log("=" * 60)
+    log(f"  gen_dir       = {args.gen_dir}")
+    log(f"  real_dir      = {args.real_dir}")
+    log(f"  caption_mode  = {args.caption_mode}")
+    log(f"  device        = {device}")
+    if torch.cuda.is_available():
+        log(f"  GPU           = {torch.cuda.get_device_name(0)}")
+
+    t_total = time.time()
+
     gen_images = list_images(args.gen_dir)
     real_images = list_images(args.real_dir)
+    log(f"  Found {len(gen_images)} generated images, {len(real_images)} real images")
     if args.max_gen_images is not None:
         gen_images = gen_images[: args.max_gen_images]
+        log(f"  Capped generated images to {len(gen_images)}")
     if args.max_real_images is not None:
         real_images = real_images[: args.max_real_images]
+        log(f"  Capped real images to {len(real_images)}")
 
     if len(gen_images) < 2 or len(real_images) < 2:
         raise RuntimeError("Need at least 2 generated and 2 real images to compute FID/sFID.")
 
+    log("")
+    log("─" * 40)
+    log("Loading Inception-v3...")
+    t0 = time.time()
     extractor, mean, std = get_inception_extractor(device)
+    log(f"  Inception loaded in {elapsed(t0)}")
+
+    log("")
+    log("─" * 40)
+    log("Extracting features from GENERATED images...")
     mu_g, cov_g, mu_gs, cov_gs, n_g, ns_g = running_stats_from_paths(
         gen_images, extractor, mean, std, device, args.batch_size, args.num_workers
     )
+    log("")
+    log("Extracting features from REAL images...")
     mu_r, cov_r, mu_rs, cov_rs, n_r, ns_r = running_stats_from_paths(
         real_images, extractor, mean, std, device, args.batch_size, args.num_workers
     )
 
+    log("")
+    log("─" * 40)
+    log("Computing FID & sFID...")
     fid = frechet_distance(mu_g, cov_g, mu_r, cov_r)
     sfid = frechet_distance(mu_gs, cov_gs, mu_rs, cov_rs)
+    log(f"  FID  = {fid:.4f}")
+    log(f"  sFID = {sfid:.4f}")
 
+    log("")
+    log("─" * 40)
+    log("Loading prompts for CLIP scoring...")
     prompts = load_prompts(
         num_images=len(gen_images),
         caption_mode=args.caption_mode,
@@ -267,6 +325,12 @@ def main():
         prompt_file=args.prompt_file,
         prompt=args.prompt,
     )
+    log(f"  Loaded {len(prompts)} prompts (mode={args.caption_mode})")
+    log(f"  First prompt: {prompts[0][:80]}...")
+
+    log("")
+    log("─" * 40)
+    log("Computing CLIP score...")
     mean_cos, clip_score = compute_clip_score(
         image_paths=gen_images, prompts=prompts, device=device, batch_size=args.clip_batch_size
     )
@@ -282,12 +346,19 @@ def main():
         "CLIP_score_x100": clip_score,
     }
 
+    log("")
+    log("=" * 60)
+    log("RESULTS")
+    log("=" * 60)
     print(json.dumps(result, indent=2))
     if args.save_json is not None:
         out = Path(args.save_json)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        log(f"  Saved to {out}")
+    log(f"Total wall time: {elapsed(t_total)}")
 
 
 if __name__ == "__main__":
     main()
+
